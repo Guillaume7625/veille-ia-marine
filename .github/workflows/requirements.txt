@@ -1,2 +1,4 @@
 feedparser
 pandas
+argostranslate==1.9.6
+sentencepiece
