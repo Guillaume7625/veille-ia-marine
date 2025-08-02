@@ -1,67 +1,139 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Veille IA – Militaire / Marine (GitHub Actions + Pages)
-- Fenêtre glissante paramétrable (env DAYS_WINDOW, défaut 30 jours)
-- Filtrage obligatoire : IA + (défense/marine/cyber…)
-- Traduction offline EN→FR (Argos) des résumés anglais uniquement
-- Déduplication (hash titre+lien)
-- UI Tailwind + filtres simples + export CSV (sans template string JS)
-- Déploiement vers docs/index.html
-Aucune télémétrie.
+Veille IA – Militaire (Marine) – full web, offline FR summaries, scoring contextuel
+- Fenêtre glissante configurable (DAYS_WINDOW)
+- Filtrage strict: IA OBLIGATOIRE + Défense/Marine/Cyber OBLIGATOIRE
+- Déduplication (titre|lien)
+- Traduction offline EN→FR via Argos (si OFFLINE_TRANSLATION=1)
+- Scoring contextuel (densité, co-occurrence IA+DEF, autorité source, fraîcheur)
+- Catégorisation avancée + tags intelligents
+- UI Tailwind + filtres (niveau, source, catégorie) + export CSV
+- Sortie: docs/index.html (pour GitHub Pages)
+
+Dépendances : feedparser, argostranslate
 """
 
 import os
 import re
-import html
-import hashlib
+import html as htmllib
+import unicodedata
 import calendar
+import time
+from hashlib import md5
 from datetime import datetime, timezone, timedelta
 
+import urllib.request
 import feedparser
 
-# ========= CONFIG =========
+# ========================== Configuration ==========================
+
+# Fenêtre glissante (jours)
 DAYS_WINDOW = int(os.getenv("DAYS_WINDOW", "30"))
+
+# Sortie GitHub Pages
 OUT_DIR = "docs"
 OUT_FILE = "index.html"
-MAX_SUMMARY_CHARS = 500
-OFFLINE_TRANSLATION = os.getenv("OFFLINE_TRANSLATION", "true").lower() in {"1", "true", "yes"}
-ARGOS_FROM_LANG = "en"
-ARGOS_TO_LANG = "fr"
 
-# Flux RSS (tu peux en ajouter/retirer)
+# Longueur max des résumés FR
+MAX_SUMMARY_FR_CHARS = int(os.getenv("MAX_SUMMARY_FR_CHARS", "280"))
+
+# Traduction offline via Argos
+OFFLINE_TRANSLATION = os.getenv("OFFLINE_TRANSLATION", "0") in {"1", "true", "True"}
+
+# Seuil de pertinence contextuelle (0–1.5 borné)
+RELEVANCE_MIN = float(os.getenv("RELEVANCE_MIN", "0.55"))
+
+# Demi-vie (jours) pour la fraîcheur (temporal_relevance)
+HALF_LIFE_DAYS = int(os.getenv("HALF_LIFE_DAYS", "15"))
+
+# User-Agent explicite pour améliorer l’accès aux RSS
+UA = "VeilleIA/1.0 (+https://github.com/guillaume7625/veille-ia-marine)"
+
+# Feeds (nom lisible -> URL)
 RSS_FEEDS = {
-    "Numerama":             "https://www.numerama.com/feed/",
-    "ActuIA":               "https://www.actuia.com/feed/",
-    "VentureBeat AI":       "https://venturebeat.com/category/ai/feed/",
-    "C4ISRNET":             "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
-    "Breaking Defense":     "https://breakingdefense.com/feed/",
-    "Naval Technology":     "https://www.naval-technology.com/feed/",
-    # "Defense News":       "https://www.defensenews.com/arc/outboundfeeds/rss/",
-    # "Naval News":         "https://www.navalnews.com/feed/",
+    # IA FR
+    "ActuIA": "https://www.actuia.com/feed/",
+    "Numerama": "https://www.numerama.com/feed/",
+    # IA EN (généralistes orientées entreprise)
+    "AI News | VentureBeat": "https://venturebeat.com/category/ai/feed/",
+    # Défense / Naval / Cyber
+    "C4ISRNet": "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
+    "Breaking Defense": "https://breakingdefense.com/feed/",
+    "Naval Technology": "https://www.naval-technology.com/feed/",
+    "Cybersecurity Dive - Latest News": "https://www.cybersecuritydive.com/feeds/news/",
 }
 
-# Vocabulaires
+# Forcer la traduction pour ces sources (même si détection langue hésite)
+EN_SOURCES = {
+    "AI News | VentureBeat",
+    "VentureBeat AI",
+    "VentureBeat",
+    "Breaking Defense",
+    "Defense News",
+    "Defense One",
+    "C4ISRNet",
+    "Naval Technology",
+    "Cybersecurity Dive - Latest News",
+}
+
+# Pondération par mots-clés (héritage pour score/level)
+KEYWORDS_WEIGHTS = {
+    # IA
+    "intelligence artificielle": 4, "ia": 3, "ai": 3,
+    "machine learning": 3, "apprentissage": 2, "deep learning": 3,
+    "algorithme": 2, "transformer": 2, "llm": 3, "génératif": 2, "generative": 2,
+    "agent": 2, "multi-agent": 2, "vision": 2, "nlp": 2, "inférence": 2, "inference": 2,
+    # Défense/Marine/Cyber
+    "marine": 5, "naval": 5, "navy": 5, "navire": 3, "frégate": 4, "sous-marin": 5, "maritime": 3,
+    "armée": 3, "defense": 4, "défense": 4, "otan": 4, "nato": 4, "doctrine": 3,
+    "cyber": 4, "cybersécurité": 4, "cyberdéfense": 5,
+    "radar": 3, "sonar": 4, "drone": 4, "uav": 4, "aéronaval": 5,
+    "brouillage": 4, "guerre électronique": 5, "satellite": 3, "reconnaissance": 3,
+    "c4isr": 5, "isr": 4, "c2": 4, "command": 3,
+    # Soutien/log
+    "logistique": 3, "maintenance": 3, "mco": 3, "supply chain": 2,
+    "entraînement": 2, "training": 2, "interoperability": 2, "readiness": 2, "modernisation": 2,
+}
+
+# Hints de base pour les filtres « IA obligatoire » et « Défense obligatoire »
 AI_HINTS = {
-    " ai ", "artificial intelligence", "intelligence artificielle",
-    "machine learning", "deep learning", "gpt", "llm", "model", "modèle",
-    "neural", "agent", "multi-agent", "computer vision", "nlp", "rlhf",
+    "ia", "intelligence artificielle", "ai", "machine learning", "apprentissage",
+    "deep learning", "algorithme", "transformer", "llm", "génératif", "generative",
+    "agent", "multi-agent", "nlp", "vision", "inférence", "inference",
 }
-
 DEFENSE_HINTS = {
-    "défense","defense","marine","naval","navy","otan","nato","armée","forces",
-    "cyber","cybersécurité","cybersecurity","uav","drone","ew","electronic warfare",
-    "sonar","radar","missile","satellite","space force","c4isr","isr","command",
-    "datalink","interoperability","multi-domain","sous-marin","frégate","aéronaval",
+    # combat/plateformes/ops
+    "marine", "naval", "navy", "frégate", "sous-marin", "sonar", "radar",
+    "drone", "uav", "missile", "aéronaval", "c4isr", "isr", "ew", "guerre électronique",
+    "otan", "nato", "armée", "forces", "c2", "command",
+    # soutien/doctrine/cyber
+    "logistique", "maintenance", "mco", "supply chain", "entraînement", "training",
+    "interoperability", "readiness", "modernisation",
+    "cyber", "cybersécurité", "cyberdéfense", "ransomware", "intrusion",
 }
 
-NOISE_TERMS = {
-    "jeux vidéo","gameplay","deal du jour","meilleur prix","précommande","précommander",
-    "série netflix","prime video","battlefield","nintendo","playstation","xbox",
-    "bons plans","promo","cinéma","people","test jeu",
+# Anti-bruit (regex)
+EXCLUSION_PATTERNS = [
+    r"\b(deal|promo|bon\s?plan|meilleur prix|précommander?)\b",
+    r"\b(gaming|jeu(x)? vidéo|streaming|people|cinéma)\b",
+    r"\b(rumeur|leak|spoiler)\b",
+    r"\b(smartphone|gadget|wearable)\b",
+]
+
+# Pondération par source (autorité) pour scoring contextuel
+SOURCE_WEIGHTS = {
+    "C4ISRNet": 1.15,
+    "Breaking Defense": 1.15,
+    "Naval Technology": 1.10,
+    "AI News | VentureBeat": 1.05,
+    "VentureBeat AI": 1.05,
+    "Numerama": 1.00,
+    "ActuIA": 1.00,
 }
 
-# ========= Utils texte =========
+# ========================== Utilitaires ==========================
+
 def strip_html(text: str) -> str:
     if not text:
         return ""
@@ -69,93 +141,23 @@ def strip_html(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def normalize(txt: str) -> str:
-    return re.sub(r"\s+", " ", (txt or "").lower()).strip()
+def normalize(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
 
-def contains_any(text: str, vocab: set) -> bool:
+def contains_any(text: str, vocab: set[str]) -> bool:
     t = normalize(text)
     return any(k in t for k in vocab)
 
-# ========= Détection langue & traduction (offline) =========
-def is_english(text: str) -> bool:
-    """Heuristique simple suffisante pour résumés presse."""
-    if not text or len(text) < 24:
-        return False
-    t = f" {text.lower()} "
-    en_markers = [" the ", " and ", " with ", " from ", " this ", " that ", " will ", " would ", " can ", " could ", " has ", " have "]
-    return sum(t.count(w) for w in en_markers) > 1
-
-_ARGOS_TRANSLATION = None
-
-def init_argos_translation():
-    """Charge la traduction EN->FR si disponible (installée par le workflow)."""
-    global _ARGOS_TRANSLATION
-    if _ARGOS_TRANSLATION is not None:
-        return _ARGOS_TRANSLATION
-    if not OFFLINE_TRANSLATION:
-        _ARGOS_TRANSLATION = None
-        return None
-    try:
-        from argostranslate import translate
-        langs = translate.get_installed_languages()
-        from_lang = next((l for l in langs if l.code == ARGOS_FROM_LANG), None)
-        to_lang = next((l for l in langs if l.code == ARGOS_TO_LANG), None)
-        if from_lang and to_lang:
-            _ARGOS_TRANSLATION = from_lang.get_translation(to_lang)
-        else:
-            _ARGOS_TRANSLATION = None
-    except Exception as e:
-        print(f"[Argos] init error: {e}")
-        _ARGOS_TRANSLATION = None
-    return _ARGOS_TRANSLATION
-
-def translate_en_to_fr_offline(text: str) -> str:
-    if not OFFLINE_TRANSLATION or not text:
-        return text
-    tr = init_argos_translation()
-    if not tr:
-        return text
-    try:
-        return tr.translate(text)
-    except Exception as e:
-        print(f"[Argos] translation error: {e}")
-        return text
-
-def summarize_fr(raw_text: str) -> tuple[str, bool]:
-    """
-    Retourne (résumé_FR, traduit_bool)
-    - si EN -> traduit en FR
-    - si FR -> inchangé
-    - tronque à MAX_SUMMARY_CHARS
-    """
-    txt = strip_html(raw_text)
-    if is_english(txt):
-        txt = translate_en_to_fr_offline(txt)
-        translated = True
-    else:
-        translated = False
-
-    # Résumé extractif simple : 1-2 phrases
-    sents = re.split(r'(?<=[\.\!\?])\s+', txt)
-    sents = [s.strip() for s in sents if len(s.strip()) > 10]
-    summary = " ".join(sents[:2]) if sents else txt
-    if len(summary) > MAX_SUMMARY_CHARS:
-        summary = summary[:MAX_SUMMARY_CHARS-1].rsplit(" ", 1)[0] + "…"
-    return summary, translated
-
-# ========= Scoring / dédup =========
-def compute_score(title: str, summary: str) -> tuple[int, str]:
-    base = 1 if contains_any(title + " " + summary, AI_HINTS) else 0
-    bonus = 2 if contains_any(title + " " + summary, DEFENSE_HINTS) else 0
-    score = base + bonus
-    level = "HIGH" if score >= 3 else "MEDIUM" if score == 2 else "LOW"
-    return score, level
-
 def entry_hash(title: str, link: str) -> str:
-    return hashlib.md5((normalize(title) + "|" + (link or "")).encode("utf-8")).hexdigest()
+    return md5(f"{title}|{link}".encode("utf-8")).hexdigest()
 
-# ========= RSS helpers =========
 def parse_entry_datetime(entry):
+    # feedparser expose published_parsed/updated_parsed (struct_time)
     for attr in ("published_parsed", "updated_parsed"):
         t = getattr(entry, attr, None)
         if t:
@@ -163,47 +165,243 @@ def parse_entry_datetime(entry):
                 return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
             except Exception:
                 pass
+    # Quelques flux n’ont que des strings
     for attr in ("published", "updated", "pubDate"):
         s = entry.get(attr, "")
         if s:
             try:
-                return datetime.fromisoformat(s)
+                # tentative simple
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(s)
+                if not dt.tzinfo:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
             except Exception:
                 pass
     return None
 
-# ========= HTML =========
+def parse_rss_with_headers(url: str, retries: int = 2, timeout: int = 25):
+    for i in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            return feedparser.parse(data)
+        except Exception as e:
+            if i == retries:
+                print(f"[ERROR] RSS fetch failed ({url}): {e}")
+                return feedparser.FeedParserDict(feed={}, entries=[])
+            time.sleep(1.5 * (i + 1))
+
+def detect_language_simple(text: str) -> str:
+    if not text:
+        return "unknown"
+    t = " " + text.lower() + " "
+    fr = [' le ', ' la ', ' les ', ' un ', ' une ', ' des ', ' du ', ' de ', ' qui ', ' que ', ' où ', ' est ', ' sont ', ' avec ', ' dans ', ' pour ', ' sur ']
+    en = [' the ', ' and ', ' with ', ' from ', ' that ', ' this ', ' which ', ' what ', ' where ', ' when ', ' how ', ' why ', ' can ', ' will ', ' would ', ' should ']
+    f = sum(1 for m in fr if m in t)
+    e = sum(1 for m in en if m in t)
+    if f > e: return "fr"
+    if e > f: return "en"
+    return "unknown"
+
+def translate_offline_en_to_fr(text: str) -> str:
+    if not text or not OFFLINE_TRANSLATION:
+        return text
+    try:
+        # Argos >= 1.9
+        from argostranslate import translate as argos_translate
+        argos_translate.load_installed_packages()
+        out = argos_translate.translate(text, "en", "fr")
+        return out if out else text
+    except Exception as e:
+        print(f"[WARN] Argos translate failed: {e}")
+        return text
+
+def generate_french_summary(raw_text: str, max_chars: int = 280, *, force_en: bool = False):
+    """
+    Produit un résumé FR:
+      - Si force_en=True => traduit EN→FR quoi qu'il arrive
+      - Sinon: FR natif → extractif ; EN/UNK → traduction via Argos
+    Retourne: (summary_fr, is_translated, detected_lang)
+    """
+    if not raw_text:
+        return "", False, "unknown"
+
+    clean = strip_html(raw_text)
+    lang = detect_language_simple(clean)
+
+    # Découpage en 1–2 phrases
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
+    base = " ".join(sentences[:2]) if sentences else clean
+
+    if not force_en and lang == "fr":
+        summary = base
+        translated = False
+    else:
+        summary_en = base
+        summary_fr = translate_offline_en_to_fr(summary_en)
+        translated = (summary_fr.strip() != summary_en.strip())
+        summary = summary_fr
+
+    if len(summary) > max_chars:
+        summary = summary[:max_chars - 1].rsplit(" ", 1)[0] + "…"
+
+    return summary, translated, lang
+
+# ====================== Scoring contextuel avancé ======================
+
+def split_sentences(txt: str) -> list[str]:
+    if not txt: return []
+    parts = re.split(r'(?<=[\.\!\?])\s+', txt)
+    return [p.strip() for p in parts if len(p.strip()) > 0]
+
+IA_CONTEXT = {
+    "core": {"ia","intelligence artificielle","ai","machine learning","apprentissage","deep learning"},
+    "applications": {"computer vision","nlp","reconnaissance","prédiction","anomaly"},
+    "techniques": {"transformer","neuronal","neural","algorithme","fine-tuning","inférence","inference"},
+    "emerging": {"llm","génératif","generative","multimodal","agent","multi-agent","edge computing"},
+}
+DEF_CONTEXT = {
+    "operations": {"c4isr","isr","warfare","mission","tactical","command","c2","joint"},
+    "plateformes": {"naval","marine","navy","uav","drone","frégate","sous-marin","sonar","radar","missile","aéronaval"},
+    "support": {"logistique","maintenance","mco","supply chain","training","entraînement","interoperability","readiness","modernisation"},
+    "cyber": {"cyber","cybersécurité","ransomware","intrusion","zero-day","xdr","edr","soc","threat intelligence"},
+}
+
+def keyword_density(text: str, groups: dict[str,set[str]]) -> float:
+    if not text: return 0.0
+    t = normalize(text)
+    words = max(50, len(t.split()))
+    score = 0.0
+    for weight, (_, terms) in enumerate(groups.items(), start=1):
+        for k in terms:
+            if k in t:
+                score += 0.6 * weight
+    return min(1.0, score / words * 8.0)
+
+def co_occurrence_bonus(text: str) -> float:
+    if not text: return 1.0
+    bonus = 1.0
+    for s in split_sentences(text):
+        t = normalize(s)
+        ia = any(k in t for g in IA_CONTEXT.values() for k in g)
+        df = any(k in t for g in DEF_CONTEXT.values() for k in g)
+        if ia and df:
+            bonus += 0.08
+    return min(bonus, 1.4)
+
+def source_authority(src: str) -> float:
+    return SOURCE_WEIGHTS.get(src, 1.0)
+
+def temporal_relevance(dt: datetime) -> float:
+    if not isinstance(dt, datetime): return 0.9
+    age_days = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
+    return max(0.6, 0.5 ** (age_days / max(1, HALF_LIFE_DAYS)))
+
+def matches_exclusion(text: str) -> bool:
+    t = normalize(text)
+    for pat in EXCLUSION_PATTERNS:
+        if re.search(pat, t):
+            # Tolère si fort contexte DEF (évite faux-positifs training/contract côté pro)
+            def_ctx = any(k in t for g in DEF_CONTEXT.values() for k in g)
+            if not def_ctx:
+                return True
+    return False
+
+def calculate_relevance_score(text: str, src: str, dt: datetime) -> float:
+    kd_ia = keyword_density(text, IA_CONTEXT)
+    kd_def = keyword_density(text, DEF_CONTEXT)
+    dens = (kd_ia * 0.6 + kd_def * 0.4)
+    bonus = co_occurrence_bonus(text)
+    srcw = source_authority(src)
+    fresh = temporal_relevance(dt)
+    score = dens * bonus * srcw * fresh
+    return max(0.0, min(1.5, score))
+
+def classify_category(text: str) -> str:
+    t = normalize(text)
+    if any(k in t for k in {"doctrine","policy","réglementation","regulation","budget","contract","contrat","procurement","acquisition"}):
+        return "POLICY"
+    if any(k in t for k in {"prototype","test","trial","essai","r&d","laboratoire","lab"}):
+        return "DEVELOPMENT"
+    if any(k in t for k in {"déployé","deployment","fielded","opérationnel","exercise","exercice","retour d'expérience","retour terrain"}):
+        return "OPERATIONAL"
+    if any(k in t for k in {"menace","threat","intrusion","ransomware","ew","electronic warfare","counter-uas","counter uas"}):
+        return "THREAT"
+    if any(k in t for k in {"partnership","alliance","accord","coopération","framework","mou","moa"}):
+        return "PARTNERSHIP"
+    if any(k in t for k in {"breakthrough","rupture","sota","state of the art","record","unprecedented"}):
+        return "BREAKTHROUGH"
+    return "DEVELOPMENT"
+
+def generate_smart_tags(text: str) -> str:
+    t = normalize(text)
+    tags = set()
+    # TRL
+    m = re.search(r"\btrl\s?([1-9])\b", t)
+    if m:
+        tags.add(f"TRL{m.group(1)}")
+    # Domaines
+    if any(k in t for k in DEF_CONTEXT["cyber"]): tags.add("Cyber")
+    if any(k in t for k in DEF_CONTEXT["plateformes"]): tags.add("Naval/Plateformes")
+    if any(k in t for k in DEF_CONTEXT["support"]): tags.add("Soutien/Log")
+    if any(k in t for k in DEF_CONTEXT["operations"]): tags.add("C2/ISR")
+    # IA type
+    if any(k in t for k in IA_CONTEXT["emerging"]): tags.add("Génératif/LLM")
+    if any(k in t for k in IA_CONTEXT["applications"]): tags.add("Applications")
+    if any(k in t for k in IA_CONTEXT["techniques"]): tags.add("Techniques")
+    return ", ".join(sorted(tags)) or "—"
+
+# ===================== Score/Level (héritage) =====================
+
+def compute_score(title: str, summary_fr: str):
+    txt = normalize(f"{title or ''} {summary_fr or ''}")
+    score = 0
+    for k, w in KEYWORDS_WEIGHTS.items():
+        if k in txt:
+            score += w
+    level = "HIGH" if score >= 9 else "MEDIUM" if score >= 5 else "LOW"
+    return score, level
+
+# ============================ HTML ============================
+
 def build_html(items: list[dict]):
     total = len(items)
     high = sum(1 for x in items if x["level"] == "HIGH")
     sources_count = len({x["source"] for x in items})
     translated_count = sum(1 for x in items if x["translated"])
+    cats = sorted({x["category"] for x in items})
 
     def lv_badge(lv: str) -> str:
-        return {"HIGH":"bg-red-600","MEDIUM":"bg-orange-600","LOW":"bg-green-600"}.get(lv,"bg-gray-500")
+        return {"HIGH": "bg-red-600", "MEDIUM": "bg-orange-600", "LOW": "bg-green-600"}.get(lv, "bg-gray-500")
 
     rows = []
     for e in items:
         tr_badge = ' <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span>' if e["translated"] else ""
         rows.append(
-            f"<tr class='hover:bg-gray-50' data-level='{e['level']}' data-source='{html.escape(e['source'])}'>"
+            f"<tr class='hover:bg-gray-50' data-level='{e['level']}' data-source='{htmllib.escape(e['source'])}' data-cat='{e['category']}'>"
             f"<td class='p-3 text-sm text-gray-600'>{e['date']}</td>"
-            f"<td class='p-3 text-xs'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded'>{html.escape(e['source'])}</span></td>"
-            f"<td class='p-3'><a class='text-blue-700 hover:underline font-semibold' target='_blank' href='{html.escape(e['link'])}'>{html.escape(e['title'])}</a></td>"
-            f"<td class='p-3 text-sm text-gray-800'>{html.escape(e['summary'])}{tr_badge}</td>"
+            f"<td class='p-3 text-xs'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded'>{htmllib.escape(e['source'])}</span></td>"
+            f"<td class='p-3'><a class='text-blue-700 hover:underline font-semibold' target='_blank' href='{htmllib.escape(e['link'])}'>{htmllib.escape(e['title'])}</a></td>"
+            f"<td class='p-3 text-sm text-gray-800'>{htmllib.escape(e['summary'])}{tr_badge}</td>"
             f"<td class='p-3 text-center'><span class='bg-indigo-100 text-indigo-800 px-2 py-1 rounded text-sm font-bold'>{e['score']}</span></td>"
             f"<td class='p-3 text-center'><span class='text-white px-2 py-1 rounded text-xs {lv_badge(e['level'])}'>{e['level']}</span></td>"
-            f"<td class='p-3 text-sm'>{html.escape(e['tags'])}</td>"
+            f"<td class='p-3 text-sm'><span class='px-2 py-1 rounded text-white text-xs' style='background:#0f766e'>{e['category']}</span></td>"
+            f"<td class='p-3 text-center text-sm'><span class='bg-gray-100 text-gray-800 px-2 py-1 rounded'>{e['rscore']}</span></td>"
+            f"<td class='p-3 text-sm'>{htmllib.escape(e['tags'])}</td>"
             "</tr>"
         )
 
     generated = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    options_html = "".join(f"<option value='{c}'>{c}</option>" for c in cats)
 
-    # f-string: doubles accolades {{ }} pour les blocs CSS/JS
+    # f-string: doubler les accolades pour CSS
     html_page = f"""<!doctype html>
 <html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Veille IA Militaire</title>
+<title>Veille IA – Militaire</title>
 <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
 <style>
   .summary-cell {{
@@ -214,7 +412,7 @@ def build_html(items: list[dict]):
 </head>
 <body class="bg-gray-50">
 <header class="bg-blue-900 text-white">
-  <div class="max-w-6xl mx-auto px-4 py-6 flex items-center justify-between">
+  <div class="max-w-7xl mx-auto px-4 py-6 flex items-center justify-between">
     <div class="flex items-center gap-3">
       <span class="text-2xl">⚓</span>
       <div>
@@ -222,18 +420,20 @@ def build_html(items: list[dict]):
         <div class="text-blue-200 text-sm">Fenêtre {DAYS_WINDOW} jours • Généré : {generated}</div>
       </div>
     </div>
-    <button id="btnCsv" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">Exporter CSV</button>
+    <div class="flex items-center gap-2">
+      <button id="btnCsv" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">Exporter CSV</button>
+    </div>
   </div>
 </header>
 
-<main class="max-w-6xl mx-auto px-4 py-6">
-  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+<main class="max-w-7xl mx-auto px-4 py-6">
+  <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
     <div class="bg-white rounded shadow p-4 text-center">
       <div class="text-3xl font-bold text-blue-700">{total}</div>
-      <div class="text-gray-600">Articles analysés</div>
+      <div class="text-gray-600">Articles</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-red-600">{high}</div>
+      <div class="text-3xl font-bold text-red-600">{sum(1 for x in items if x["level"] == "HIGH")}</div>
       <div class="text-gray-600">Priorité Haute</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
@@ -242,12 +442,16 @@ def build_html(items: list[dict]):
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
       <div class="text-3xl font-bold text-purple-600">{translated_count}</div>
-      <div class="text-gray-600">Articles traduits</div>
+      <div class="text-gray-600">Traduit FR</div>
+    </div>
+    <div class="bg-white rounded shadow p-4 text-center">
+      <div class="text-sm text-gray-600">Seuil pertinence</div>
+      <div class="text-xl font-semibold">{RELEVANCE_MIN}</div>
     </div>
   </div>
 
   <div class="bg-white rounded shadow p-4 mb-4">
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
       <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…" class="border rounded px-3 py-2">
       <select id="level" class="border rounded px-3 py-2">
         <option value="">Niveau (tous)</option>
@@ -256,6 +460,10 @@ def build_html(items: list[dict]):
         <option value="LOW">LOW</option>
       </select>
       <input id="source" type="search" placeholder="Filtrer par source…" class="border rounded px-3 py-2">
+      <select id="cat" class="border rounded px-3 py-2">
+        <option value="">Catégorie (toutes)</option>
+        {options_html}
+      </select>
     </div>
   </div>
 
@@ -269,6 +477,8 @@ def build_html(items: list[dict]):
           <th class="text-left p-3">Résumé (FR)</th>
           <th class="text-left p-3">Score</th>
           <th class="text-left p-3">Niveau</th>
+          <th class="text-left p-3">Catégorie</th>
+          <th class="text-left p-3">Pertinence</th>
           <th class="text-left p-3">Tags</th>
         </tr>
       </thead>
@@ -285,45 +495,49 @@ def build_html(items: list[dict]):
   const q = document.getElementById("q");
   const level = document.getElementById("level");
   const source = document.getElementById("source");
+  const cat = document.getElementById("cat");
 
   function applyFilters() {{
     const qv = (q.value || "").toLowerCase();
     const lv = level.value;
     const sv = (source.value || "").toLowerCase();
+    const cv = cat.value;
     rows.forEach(tr => {{
       const t = tr.innerText.toLowerCase();
       const rl = tr.getAttribute("data-level") || "";
       const rs = (tr.getAttribute("data-source") || "").toLowerCase();
+      const rc = tr.getAttribute("data-cat") || "";
       let ok = true;
       if (qv && !t.includes(qv)) ok = false;
       if (lv && rl !== lv) ok = false;
       if (sv && !rs.includes(sv)) ok = false;
+      if (cv && rc !== cv) ok = false;
       tr.style.display = ok ? "" : "none";
     }});
   }}
-  [q, level, source].forEach(el => el.addEventListener("input", applyFilters));
+  [q, level, source, cat].forEach(el => el.addEventListener("input", applyFilters));
 
-  // Export CSV (sans template string JS pour éviter les f-strings Python)
   document.getElementById("btnCsv").addEventListener("click", () => {{
-    const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Tags"];
+    const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Catégorie","Pertinence","Tags"];
     const table = document.querySelector("#tbody");
     const data = [];
     for (const tr of table.querySelectorAll("tr")) {{
       if (tr.style.display === "none") continue;
       const tds = tr.querySelectorAll("td");
-      if (tds.length < 7) continue;
+      if (tds.length < 9) continue;
       const titre = tds[2].innerText.trim();
       const lienA = tds[2].querySelector("a");
       const lien = lienA ? lienA.getAttribute("href") : "";
       const row = [
-        titre,
-        lien,
+        titre, lien,
         tds[0].innerText.trim(),
         tds[1].innerText.trim(),
         tds[3].innerText.trim(),
         tds[5].innerText.trim(),
         tds[4].innerText.trim(),
-        tds[6].innerText.trim()
+        tds[6].innerText.trim(),
+        tds[7].innerText.trim(),
+        tds[8].innerText.trim()
       ];
       data.push(row);
     }}
@@ -333,82 +547,102 @@ def build_html(items: list[dict]):
     const blob = new Blob([csv], {{type: "text/csv;charset=utf-8"}});
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = "veille_ia_militaire.csv";
-    a.click();
+    a.href = url; a.download = "veille_ia_militaire.csv"; a.click();
     URL.revokeObjectURL(url);
   }});
 }})();
 </script>
 </body></html>
 """
+    os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, OUT_FILE), "w", encoding="utf-8") as f:
         f.write(html_page)
-    print(f"[OK] Généré: {OUT_DIR}/{OUT_FILE} – {total} entrées")
+    print(f"[OK] Généré: {OUT_DIR}/{OUT_FILE} – {total} entrées – sources actives: {sources_count}")
 
-# ========= Collecte & rendu =========
+# ============================ Main ============================
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_WINDOW)
 
     items = []
-    seen = set()
+    seen_set = set()
 
-    for src, url in RSS_FEEDS.items():
-        print(f"📡 {src}")
-        try:
-            feed = feedparser.parse(url)
-        except Exception as e:
-            print(f"[WARN] RSS parse failed: {url} -> {e}")
-            continue
+    for src_name, url in RSS_FEEDS.items():
+        print(f"📡 {src_name}")
+        feed = parse_rss_with_headers(url)
+        source_title = feed.feed.get("title", src_name)
+
+        seen = ai_pass = mil_pass = kept = 0
 
         for e in feed.entries:
+            seen += 1
             dt = parse_entry_datetime(e)
             if not dt or dt < cutoff:
                 continue
 
             title = (e.get("title") or "").strip()
             link = (e.get("link") or "").strip()
-            raw_summary = e.get("summary") or e.get("description") or ""
+            raw = e.get("summary") or e.get("description") or ""
             if not title or not link:
                 continue
 
-            # Bruit hors scope
-            if contains_any(title + " " + raw_summary, NOISE_TERMS):
+            text_all = f"{title}. {strip_html(raw)}"
+
+            # Anti-bruit avant tout
+            if matches_exclusion(text_all):
                 continue
 
-            # IA + Défense obligatoires
-            if not contains_any(title + " " + raw_summary, AI_HINTS):
+            # IA obligatoire
+            if not contains_any(text_all, AI_HINTS):
                 continue
-            if not contains_any(title + " " + raw_summary, DEFENSE_HINTS):
+            ai_pass += 1
+            # Défense/Marine/Cyber obligatoire
+            if not contains_any(text_all, DEFENSE_HINTS):
                 continue
+            mil_pass += 1
 
-            # Dédup simple (titre+lien)
+            # Dédup (titre|lien)
             h = entry_hash(title, link)
-            if h in seen:
+            if h in seen_set:
                 continue
-            seen.add(h)
+            seen_set.add(h)
 
-            # Résumé FR (traduction EN→FR si nécessaire)
-            summary_fr, translated = summarize_fr(raw_summary)
+            # Résumé FR (forçage EN pour certaines sources)
+            force = (source_title in EN_SOURCES) or (src_name in EN_SOURCES)
+            summary_fr, translated, _ = generate_french_summary(raw, max_chars=MAX_SUMMARY_FR_CHARS, force_en=force)
 
-            # Score
+            # Scoring contextuel (pertinence)
+            rel = calculate_relevance_score(text_all, source_title, dt)
+            if rel < RELEVANCE_MIN:
+                continue
+
+            # Catégorie & tags
+            cat = classify_category(text_all)
+            tags = generate_smart_tags(text_all)
+
+            # Score/level (héritage)
             score, level = compute_score(title, summary_fr)
 
             items.append(dict(
                 date=dt.strftime("%Y-%m-%d"),
-                source=src,
+                source=source_title,
                 title=title,
                 link=link,
                 summary=summary_fr,
+                translated=translated,
                 score=score,
                 level=level,
-                tags="ia, defense" if contains_any(title + " " + summary_fr, DEFENSE_HINTS) else "ia",
-                translated=translated
+                rscore=round(rel, 3),
+                category=cat,
+                tags=tags
             ))
+            kept += 1
 
-    # Tri: score desc puis date desc
-    items.sort(key=lambda x: (x["score"], x["date"]), reverse=True)
+        print(f"[SRC] {src_name} -> vus:{seen} IA_ok:{ai_pass} DEF_ok:{mil_pass} gardés:{kept}")
+
+    # Tri: pertinence desc, date desc (string YYYY-MM-DD ok), puis score hérité
+    items.sort(key=lambda x: (x["rscore"], x["date"], x["score"]), reverse=True)
     build_html(items)
 
 if __name__ == "__main__":
