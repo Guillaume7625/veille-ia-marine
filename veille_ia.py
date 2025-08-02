@@ -1,55 +1,126 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Veille IA – Marine nationale (full web, GitHub Actions + Pages) – Version RSS Only
-- 7 jours glissants
-- Dédup (titre + lien)
-- Scoring "défense/marine"
-- UI Tailwind + filtres + stats + export CSV
-Aucune télémétrie, aucun tracker tiers ajouté.
+Veille IA – Militaire (GitHub Actions + Pages)
+- IA OBLIGATOIRE + intérêt militaire (combat OU soutien/logistique/formation/industrie…)
+- Fenêtre glissante 7 jours
+- Déduplication (URL + Jaccard sur titres) + nettoyage auto > 7 jours
+- Résumés courts (2 phrases) dans la langue source (pas de traduction)
+- UI moderne (Tailwind) avec filtres et export CSV
+- Santé: docs/feed_health.json
+Aucune télémétrie, aucun tracker tiers.
 """
+
 import os
 import re
+import json
+import time
 import unicodedata
 import calendar
-from hashlib import md5
+import hashlib
 from datetime import datetime, timezone, timedelta
 
 import feedparser
 import pandas as pd
 
-# ---------------- Configuration ----------------
+# ========================= Configuration =========================
 
-RSS_FEEDS = [
+# Fenêtre de collecte / nettoyage
+MAX_ARTICLE_AGE_DAYS = int(os.getenv("DAYS_WINDOW", "7"))
+
+# Sortie GitHub Pages (publier docs/)
+OUT_DIR = "docs"
+OUT_FILE = "index.html"
+MAX_SUMMARY_CHARS = 280
+
+# IA obligatoire & intérêt militaire obligatoire
+REQUIRE_AI = True
+MIL_REQUIRED = True
+BOOST_DEFENSE = 2  # bonus si IA + (marine/cyber/C2/ISR/logistique…)
+
+# Déduplication
+ENABLE_DEDUPLICATION = True
+JACCARD_TITLE_THRESHOLD = 0.80  # seuil Jaccard titres
+
+# Sources RSS (nom lisible -> URL)
+RSS_SOURCES = {
     # IA FR
-    "https://www.actuia.com/feed/",
-    "https://www.usine-digitale.fr/rss/technos/intelligence-artificielle/",
-    "https://www.ia-data.fr/feed/",
-    "https://www.numerama.com/feed/",
+    "ActuIA": "https://www.actuia.com/feed/",
+    "Usine Digitale – IA": "https://www.usine-digitale.fr/rss/technos/intelligence-artificielle/",
+    "IA-Data": "https://www.ia-data.fr/feed/",
+    "Numerama – Tech": "https://www.numerama.com/feed/",
     # IA EN
-    "https://venturebeat.com/category/ai/feed/",
-    "https://feeds.feedburner.com/mittechnologyreview/artificial-intelligence",
-    "https://spectrum.ieee.org/rss/topic/artificial-intelligence",
-    # Défense / Naval / Cyber
-    "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
-    "https://breakingdefense.com/feed/",
-    "https://www.naval-technology.com/feed/",
-    "https://www.cybersecuritydive.com/feeds/news/",
+    "VentureBeat – AI": "https://venturebeat.com/category/ai/feed/",
+    "MIT Tech Review – AI": "https://feeds.feedburner.com/mittechnologyreview/artificial-intelligence",
+    "IEEE Spectrum – AI": "https://spectrum.ieee.org/rss/topic/artificial-intelligence",
+    # Défense / Naval / Cyber (filtrées ensuite par IA obligatoire)
+    "C4ISRNet": "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
+    "Breaking Defense": "https://breakingdefense.com/feed/",
+    "Naval Technology": "https://www.naval-technology.com/feed/",
+    "Cybersecurity Dive": "https://www.cybersecuritydive.com/feeds/news/",
+}
+
+# -------------------- Vocabulaires & filtres ---------------------
+
+# Détection IA par REGEX (sur texte normalisé, sans accents)
+AI_PATTERNS = [
+    r"\bintelligence artificielle\b",
+    r"\bia\b", r"\bgenerative ai\b",
+    r"\bmachine learning\b", r"\bdeep learning\b",
+    r"\bneural network(s)?\b", r"\bcomputer vision\b",
+    r"\blarge language model(s)?\b", r"\bllm(s)?\b",
+    r"\btransformer(s)?\b",
+    r"\bapprentissage automatique\b", r"\bapprentissage profond\b",
+    r"\bmodele de langage\b", r"\binference\b",
+    r"\bagent(s)? autonome(s)?\b", r"\bagent(s)?\b",
 ]
 
-DAYS_WINDOW = int(os.getenv("DAYS_WINDOW", "7"))
-OUT_DIR = "docs"
-OUT_FILE = "index.html"   # GitHub Pages servira docs/index.html
-MAX_SUMMARY_CHARS = 500
-
-KEYWORDS_WEIGHTS = {
-    "marine": 5, "naval": 5, "navire": 3, "frégate": 4, "sous-marin": 5, "maritime": 3,
-    "armée": 3, "defense": 4, "défense": 4, "otan": 4, "nato": 4, "doctrine": 3,
-    "souveraineté": 4, "cyber": 4, "cybersécurité": 4, "cyberdéfense": 5,
-    "radar": 3, "sonar": 4, "drone": 4, "uav": 4, "aéronaval": 5,
-    "brouillage": 4, "guerre électronique": 5, "satellite": 3, "reconnaissance": 3,
-    "mistral": 2, "ia générative": 2, "modèle souverain": 3, "renseignement": 4, "osint": 3
+# Combat / ISR / effets
+MIL_COMBAT_HINTS = {
+    "c2", "jadc2", "command and control", "battle management", "bms",
+    "c4isr", "isr", "renseignement", "osint", "ew", "guerre electronique",
+    "anti-jam", "tactical data link", "link-16", "satcom", "pnt", "gnss",
+    "drone", "uav", "ucav", "loitering", "munitions", "targeting",
+    "sonar", "asw", "radar", "missile", "counter-uas", "electronic warfare",
+    "sensor fusion", "multi-domain", "kill chain", "force protection",
+    "cbrn", "nbc", "manpads", "sam", "datalink", "interoperability", "joint fires",
 }
+
+# Soutien / non-combat
+MIL_SUPPORT_HINTS = {
+    "logistique", "supply chain", "maintenance", "mco", "predictive maintenance",
+    "mro", "planification", "readiness", "formation", "entrainement",
+    "simulation", "wargaming", "doctrine", "procurement",
+    "acquisition", "export control", "itar", "ethique", "ihl", "loac",
+    "souverainete", "cloud de confiance", "secnumcloud", "securite des donnees",
+    "cyberdefense", "cyber defense", "detection", "reponse a incident", "hardening",
+}
+
+# Domaines privilégiés
+MARITIME_HINTS = {"marine", "naval", "navy", "fregate", "corvette", "uuv", "auv", "mcm", "sous-marin"}
+CYBER_HINTS    = {"cyber", "cybersecurite", "cybersecurity", "ransomware", "intrusion"}
+SPACE_HINTS    = {"satellite", "constellation", "leo", "meo", "geostationary", "geostationnaire", "rf sensing"}
+C2_HINTS       = {"c2", "jadc2", "mission command", "tactical cloud", "edge", "mesh network"}
+
+# Bruit pop culture / e-commerce à exclure
+BLACKLIST_KEYWORDS = {
+    "jeu video", "jeux video", "gaming", "nintendo", "playstation", "xbox", "steam",
+    "prime video", "netflix", "disney+", "serie", "cinema", "film", "bande-originale",
+    "deal", "promo", "bon plan", "meilleur prix", "precommander", "precommande",
+    "people", "gossip", "show", "trailer",
+}
+
+# Poids de tags (pour le score de base)
+KEYWORDS_WEIGHTS = {
+    "marine": 5, "naval": 5, "navire": 3, "fregate": 4, "sous-marin": 5, "maritime": 3,
+    "armee": 3, "defense": 4, "defence": 4, "otan": 4, "nato": 4, "doctrine": 3,
+    "souverainete": 4, "cyber": 4, "cybersecurite": 4, "cyberdefense": 5,
+    "radar": 3, "sonar": 4, "drone": 4, "uav": 4, "aeronaval": 5,
+    "brouillage": 4, "guerre electronique": 5, "satellite": 3, "reconnaissance": 3,
+    "ia generative": 2, "modele souverain": 3, "renseignement": 4, "osint": 3,
+}
+
+# ========================= Utilitaires ===========================
 
 def strip_html(text: str) -> str:
     if not text:
@@ -64,7 +135,49 @@ def normalize(s: str) -> str:
     s = s.lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # harmoniser quelques caractères
+    s = s.replace("’", "'").replace("œ", "oe")
     return s
+
+def is_ai_related(title: str, summary: str) -> bool:
+    """Match IA par regex sur texte normalisé (réduit les faux positifs)."""
+    t = normalize(f"{title} {summary}")
+    return any(re.search(p, t) for p in AI_PATTERNS)
+
+def _contains_any(text: str, bag) -> bool:
+    t = normalize(text)
+    return any(k in t for k in bag)
+
+def is_noise(title: str, summary: str) -> bool:
+    return _contains_any(f"{title} {summary}", BLACKLIST_KEYWORDS)
+
+def military_relevance(title: str, summary: str):
+    """
+    Retourne (score_militaire, catégories, is_relevant)
+    - catégories dans {combat/ISR, soutien, marine, cyber, espace, C2}
+    """
+    txt = f"{title} {summary}"
+    score = 0
+    cats = []
+
+    def hit(words, w, label):
+        nonlocal score, cats
+        if _contains_any(txt, words):
+            score += w
+            cats.append(label)
+
+    hit(MIL_COMBAT_HINTS, 3, "combat/ISR")
+    hit(MIL_SUPPORT_HINTS, 4, "soutien")
+    hit(MARITIME_HINTS,   4, "marine")
+    hit(CYBER_HINTS,      3, "cyber")
+    hit(SPACE_HINTS,      2, "espace")
+    hit(C2_HINTS,         3, "C2")
+
+    is_relevant = score > 0
+    # tags uniques en conservant l'ordre
+    seen = set()
+    cats = [c for c in cats if not (c in seen or seen.add(c))]
+    return score, cats, is_relevant
 
 def score_text(title: str, summary: str):
     txt = normalize(f"{title or ''} {summary or ''}")
@@ -80,6 +193,7 @@ def score_text(title: str, summary: str):
     return score, level, tags
 
 def parse_entry_datetime(entry):
+    # 1) struct_time
     for attr in ("published_parsed", "updated_parsed"):
         t = getattr(entry, attr, None)
         if t:
@@ -87,6 +201,7 @@ def parse_entry_datetime(entry):
                 return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
             except Exception:
                 pass
+    # 2) strings
     for attr in ("published", "updated", "pubDate"):
         s = entry.get(attr, "")
         if s:
@@ -95,213 +210,307 @@ def parse_entry_datetime(entry):
                 return ts.to_pydatetime()
     return None
 
-def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(days=DAYS_WINDOW)
-
-    entries, seen = [], set()
-
-    # RSS fetch
-    for url in RSS_FEEDS:
+def parse_rss_with_retry(url: str, tries: int = 3):
+    """Parse RSS avec en-tête UA et retry exponentiel."""
+    for i in range(tries):
         try:
-            feed = feedparser.parse(url)
+            return feedparser.parse(url, request_headers={"User-Agent": "VeilleIA/1.0"})
         except Exception as e:
-            print(f"[WARN] RSS parse failed: {url} -> {e}")
-            continue
-        source_title = feed.feed.get("title", url)
-        for entry in feed.entries:
-            dt = parse_entry_datetime(entry)
-            if not dt or dt < cutoff:
-                continue
-            title = (entry.get("title") or "").strip()
-            link  = (entry.get("link")  or "").strip()
-            summary = strip_html(entry.get("summary") or entry.get("description") or "")[:MAX_SUMMARY_CHARS]
-            h = md5((title + "|" + link).encode("utf-8")).hexdigest()
-            if h in seen or not title or not link:
-                continue
-            seen.add(h)
-            score, level, tags = score_text(title, summary)
-            entries.append({
-                "DateUTC": dt, "Date": dt.strftime("%Y-%m-%d"),
-                "Source": source_title, "Titre": title, "Résumé": summary, "Lien": link,
-                "Score": score, "Niveau": level, "Tags": ", ".join(tags)
-            })
+            if i == tries - 1:
+                print(f"[ERROR] Final failure for {url}: {e}")
+            else:
+                time.sleep(2 ** i)
+    return {"entries": [], "feed": {}}
 
-    if entries:
-        df = pd.DataFrame(entries).sort_values(by=["Score", "DateUTC"], ascending=[False, False])
-    else:
-        df = pd.DataFrame(columns=["DateUTC","Date","Source","Titre","Résumé","Lien","Score","Niveau","Tags"])
+def summarize_brief(text: str, max_chars: int = 280) -> str:
+    """Résumé court (2 phrases max) dans la langue source (FR ou EN)."""
+    if not text:
+        return ""
+    clean = strip_html(text)
+    sents = re.split(r"(?<=[\.\!\?])\s+", clean)
+    sents = [s.strip() for s in sents if len(s.strip()) > 15]
+    out = " ".join(sents[:2]) or clean[:200]
+    if len(out) > max_chars:
+        out = out[: max_chars - 1].rsplit(" ", 1)[0] + "…"
+    return out
 
-    # Stats
+# ----------------- Déduplication & nettoyage ---------------------
+
+def jaccard_title(a: str, b: str) -> float:
+    ta = {w for w in re.findall(r"\w+", normalize(a)) if len(w) > 2}
+    tb = {w for w in re.findall(r"\w+", normalize(b)) if len(w) > 2}
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+def is_duplicate_article(new_entry: dict, existing_entries: list) -> bool:
+    if not ENABLE_DEDUPLICATION:
+        return False
+    for ex in existing_entries:
+        # 1) URL identique
+        if new_entry.get("Lien") and ex.get("Lien") and new_entry["Lien"] == ex["Lien"]:
+            return True
+        # 2) Titre très proche (Jaccard)
+        if jaccard_title(new_entry.get("Titre",""), ex.get("Titre","")) >= JACCARD_TITLE_THRESHOLD:
+            return True
+    return False
+
+def cleanup_old_entries(entries: list) -> list:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+    out, removed = [], 0
+    for e in entries:
+        dt = e.get("DateUTC")
+        if isinstance(dt, datetime):
+            if dt >= cutoff:
+                out.append(e)
+            else:
+                removed += 1
+        else:
+            out.append(e)
+    if removed:
+        print(f"🧹 {removed} articles supprimés (> {MAX_ARTICLE_AGE_DAYS} jours)")
+    return out
+
+# ------------------------- Rendu HTML ----------------------------
+
+from html import escape as html_escape
+
+def generate_modern_html(df: pd.DataFrame, generated_at: str, out_dir: str, out_file: str):
     total = len(df)
     high = int((df["Niveau"] == "HIGH").sum()) if total else 0
-    med  = int((df["Niveau"] == "MEDIUM").sum()) if total else 0
-    low  = int((df["Niveau"] == "LOW").sum()) if total else 0
+    sources_count = len(set(df["Source"])) if total else 0
 
-    # Export data for CSV (as JS object)
-    export_items = []
+    # Construit les lignes du tableau (sécurisé)
+    rows = []
     for _, r in df.iterrows():
-        export_items.append({
-            "titre": r.get("Titre",""),
-            "lien": r.get("Lien",""),
-            "date": r.get("Date",""),
-            "source": r.get("Source",""),
-            "resume": r.get("Résumé",""),
-            "niveau": r.get("Niveau",""),
-            "score": int(r.get("Score",0)),
-            "tags": r.get("Tags",""),
-        })
-    export_json = str(export_items).replace("'", '"')
-
-    generated_at = now_utc.strftime("%Y-%m-%d %H:%M UTC")
-
-    # HTML (accolades JS doublées, pas de f-string imbriquée)
-    row_tpl = (
-        "<tr data-level='{level}' data-source='{source}'>"
-        "<td>{date}</td><td>{source}</td><td>{title}</td><td>{summary}</td>"
-        "<td>{score}</td><td><span class='px-2 py-1 rounded text-white {color}'>{level}</span></td>"
-        "<td>{tags}</td><td><a href='{link}' target='_blank' class='text-blue-700 underline'>Lien</a></td></tr>"
-    )
-
-    def get_row(r):
-        color = "bg-red-600" if r.get("Niveau") == "HIGH" else "bg-orange-600" if r.get("Niveau") == "MEDIUM" else "bg-green-600"
-        return row_tpl.format(
-            level=r.get("Niveau",""),
-            source=r.get("Source",""),
-            date=r.get("Date",""),
-            title=r.get("Titre",""),
-            summary=r.get("Résumé",""),
+        level = str(r.get("Niveau", ""))
+        level_cls = "level-high" if level == "HIGH" else "level-medium" if level == "MEDIUM" else "level-low"
+        row = (
+            '<tr class="table-row" data-level="{lvl}" data-source="{src}">'
+            '<td class="p-4 text-sm text-gray-600">{date}</td>'
+            '<td class="p-4"><span class="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-xs font-medium">{src}</span></td>'
+            '<td class="p-4"><a href="{link}" target="_blank" rel="noopener noreferrer" '
+            'class="text-blue-700 hover:text-blue-900 font-semibold hover:underline block">{title}</a></td>'
+            '<td class="p-4 text-sm text-gray-700 summary-cell" title="{sumfull}">{summary}</td>'
+            '<td class="p-4 text-center"><span class="bg-indigo-100 text-indigo-800 px-3 py-1 rounded-full text-sm font-bold">{score}</span></td>'
+            '<td class="p-4 text-center"><span class="px-3 py-1 rounded-full text-white text-xs font-bold {lvlcls}">{lvl}</span></td>'
+            '<td class="p-4 text-sm">{tags}</td>'
+            '</tr>'
+        ).format(
+            lvl=html_escape(level),
+            src=html_escape(str(r.get("Source",""))),
+            date=html_escape(str(r.get("Date",""))),
+            link=html_escape(str(r.get("Lien",""))),
+            title=html_escape(str(r.get("Titre",""))),
+            sumfull=html_escape(str(r.get("Résumé",""))),
+            summary=html_escape(str(r.get("Résumé",""))),
             score=int(r.get("Score",0)),
-            color=color,
-            tags=r.get("Tags",""),
-            link=r.get("Lien",""),
+            lvlcls=level_cls,
+            tags=html_escape(str(r.get("Tags",""))),
         )
-    if total:
-        rows_html = "\n".join(get_row(r) for _, r in df.iterrows())
-    else:
-        rows_html = "<tr><td colspan='8' class='text-center py-6'>Aucune entrée sur la période.</td></tr>"
+        rows.append(row)
 
-    html = f"""<!doctype html>
+    html_template = """<!DOCTYPE html>
 <html lang="fr">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Veille IA – Marine nationale (7 jours)</title>
-<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎯 Veille IA Militaire – 7 jours</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .gradient-bg {{ background: linear-gradient(135deg, #1e3a8a 0%, #3730a3 100%); }}
+  .summary-cell {{ max-height: 4.5rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.5; }}
+  .table-row:hover {{ background-color: #f1f5f9; transition: background-color .2s; }}
+  .level-high {{ background: linear-gradient(45deg,#dc2626,#b91c1c); }}
+  .level-medium {{ background: linear-gradient(45deg,#d97706,#b45309); }}
+  .level-low {{ background: linear-gradient(45deg,#059669,#047857); }}
+</style>
 </head>
-<body class="bg-gray-50">
-<header class="bg-blue-900 text-white py-6">
-  <div class="max-w-6xl mx-auto px-4 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <span class="text-2xl">⚓</span>
-      <div>
-        <h1 class="text-2xl font-bold">Veille IA – Marine nationale</h1>
-        <div class="text-blue-200 text-sm">Fenêtre roulante 7 jours • Généré : {generated_at}</div>
-      </div>
+<body class="bg-gray-50 min-h-screen">
+<header class="gradient-bg text-white shadow-2xl">
+  <div class="max-w-6xl mx-auto px-6 py-8 flex items-center justify-between">
+    <div>
+      <h1 class="text-3xl md:text-4xl font-bold flex items-center">⚓&nbsp;Veille IA Militaire</h1>
+      <p class="text-blue-100 mt-1">Fenêtre {window} jours • Généré : {generated}</p>
     </div>
-    <button id="btnCsv" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">Exporter CSV</button>
+    <div class="text-right">
+      <div class="text-3xl font-bold">{total}</div>
+      <div class="text-blue-100 text-sm">Articles analysés</div>
+    </div>
   </div>
 </header>
 
-<main class="max-w-6xl mx-auto px-4 py-6">
-  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-blue-700">{total}</div>
-      <div class="text-gray-600">Articles</div>
-    </div>
-    <div class="bg-white rounded shadow p-4 text-center">
+<main class="max-w-6xl mx-auto px-6 py-8">
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+    <div class="bg-white rounded-xl shadow p-6">
+      <div class="text-sm text-gray-600">Priorité Haute</div>
       <div class="text-3xl font-bold text-red-600">{high}</div>
-      <div class="text-gray-600">Priorité Haute</div>
     </div>
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-orange-600">{med}</div>
-      <div class="text-gray-600">Priorité Moyenne</div>
+    <div class="bg-white rounded-xl shadow p-6">
+      <div class="text-sm text-gray-600">Sources actives</div>
+      <div class="text-3xl font-bold text-blue-700">{sources}</div>
     </div>
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-green-600">{low}</div>
-      <div class="text-gray-600">Priorité Faible</div>
+    <div class="bg-white rounded-xl shadow p-6">
+      <button id="btnCsv" class="w-full bg-blue-600 hover:bg-blue-500 text-white px-4 py-3 rounded-lg">Exporter CSV</button>
     </div>
   </div>
 
-  <div class="bg-white rounded shadow p-4 mb-4">
+  <div class="bg-white rounded-xl shadow p-4 mb-4">
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-      <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…"
-             class="border rounded px-3 py-2">
+      <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…" class="border rounded px-3 py-2">
       <select id="level" class="border rounded px-3 py-2">
         <option value="">Niveau (tous)</option>
         <option value="HIGH">HIGH</option>
         <option value="MEDIUM">MEDIUM</option>
         <option value="LOW">LOW</option>
       </select>
-      <input id="source" type="search" placeholder="Filtrer par source…"
-             class="border rounded px-3 py-2">
+      <input id="source" type="search" placeholder="Filtrer par source…" class="border rounded px-3 py-2">
     </div>
   </div>
 
-  <div class="bg-white rounded shadow overflow-x-auto">
+  <div class="bg-white rounded-xl shadow overflow-x-auto">
     <table class="min-w-full">
-      <thead class="bg-blue-50">
+      <thead class="bg-gray-800 text-white">
         <tr>
-          <th class="text-left p-3">Date</th>
-          <th class="text-left p-3">Source</th>
-          <th class="text-left p-3">Titre</th>
-          <th class="text-left p-3">Résumé</th>
-          <th class="text-left p-3">Score</th>
-          <th class="text-left p-3">Niveau</th>
-          <th class="text-left p-3">Tags</th>
-          <th class="text-left p-3">Lien</th>
+          <th scope="col" class="text-left p-3">Date</th>
+          <th scope="col" class="text-left p-3">Source</th>
+          <th scope="col" class="text-left p-3">Article</th>
+          <th scope="col" class="text-left p-3">Résumé</th>
+          <th scope="col" class="text-center p-3">Score</th>
+          <th scope="col" class="text-center p-3">Niveau</th>
+          <th scope="col" class="text-left p-3">Tags</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        {rows_html}
+        __ROWS__
       </tbody>
     </table>
   </div>
 </main>
 
 <script>
+// Filtres
 const rows = Array.from(document.querySelectorAll("#tbody tr"));
-const q = document.getElementById("q");
-const level = document.getElementById("level");
-const source = document.getElementById("source");
-const data = {export_json};
+const q = document.getElementById("q"), level = document.getElementById("level"), source = document.getElementById("source");
+function applyFilters(){
+  const qv=(q.value||"").toLowerCase(), lv=level.value, sv=(source.value||"").toLowerCase();
+  rows.forEach(tr=>{
+    const t=tr.innerText.toLowerCase(), rl=tr.getAttribute("data-level"), rs=(tr.getAttribute("data-source")||"").toLowerCase();
+    let ok=true; if(qv && !t.includes(qv)) ok=false; if(lv && rl!==lv) ok=false; if(sv && !rs.includes(sv)) ok=false;
+    tr.style.display= ok ? "" : "none";
+  });
+}
+[q,level,source].forEach(el=>el.addEventListener("input",applyFilters));
 
-function applyFilters() {{
-  const qv = (q.value || "").toLowerCase();
-  const lv = level.value;
-  const sv = (source.value || "").toLowerCase();
-  rows.forEach(tr => {{
-    const t = tr.innerText.toLowerCase();
-    const rl = tr.getAttribute("data-level");
-    const rs = (tr.getAttribute("data-source") || "").toLowerCase();
-    let ok = true;
-    if (qv && !t.includes(qv)) ok = false;
-    if (lv && rl !== lv) ok = false;
-    if (sv && !rs.includes(sv)) ok = false;
-    tr.style.display = ok ? "" : "none";
-  }});
-}}
-[q, level, source].forEach(el => el.addEventListener("input", applyFilters));
-
-document.getElementById("btnCsv").addEventListener("click", () => {{
-  const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Tags"];
-  const rows = data.map(a => [a.titre, a.lien, a.date, a.source, a.resume, a.niveau, a.score, a.tags]);
-  const csv = [header, ...rows].map(r => r.map(x => '"' + String(x||"").replace(/"/g,'""') + '"').join(",")).join("\\n");
-  const blob = new Blob([csv], {{type: "text/csv;charset=utf-8"}});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "veille_ia_marine.csv";
-  a.click();
-  URL.revokeObjectURL(url);
-}});
+// Export CSV (respecte filtres visuels)
+document.getElementById("btnCsv").addEventListener("click", () => {
+  const clean = s => (s||"").replace(/\\r?\\n+/g," ").trim();
+  const header=["Titre","Lien","Date","Source","Résumé","Niveau","Score","Tags"];
+  const visible=[...document.querySelectorAll("#tbody tr")].filter(tr=>tr.style.display!=="none");
+  const rows=visible.map(tr=>{
+    const tds=[...tr.querySelectorAll("td")].map(td=>clean(td.innerText));
+    return [tds[2], tr.querySelector("a")?.href || "", tds[0], tds[1], tds[3], tds[5], tds[4], tds[6]];
+  });
+  const csv=[header,...rows].map(r=>r.map(x=>`"${(x||"").replace(/"/g,'""')}"`).join(",")).join("\\n");
+  const blob=new Blob([csv],{type:"text/csv;charset=utf-8"}); const url=URL.createObjectURL(blob);
+  const a=document.createElement("a"); a.href=url; a.download="veille_ia_militaire.csv"; a.click(); URL.revokeObjectURL(url);
+});
 </script>
-</body>
-</html>
+</body></html>
 """
-    with open(os.path.join(OUT_DIR, OUT_FILE), "w", encoding="utf-8") as f:
+    html = html_template.replace("__ROWS__", "\n".join(rows) if rows else '<tr><td colspan="7" class="text-center p-6">Aucune entrée.</td></tr>')
+    html = (html
+            .replace("{window}", str(MAX_ARTICLE_AGE_DAYS))
+            .replace("{generated}", generated_at)
+            .replace("{total}", str(total))
+            .replace("{high}", str(high))
+            .replace("{sources}", str(sources_count))
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, out_file), "w", encoding="utf-8") as f:
         f.write(html)
+
+# =========================== Main ================================
+
+def main():
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+
+    collected = []
+
+    for source_name, url in RSS_SOURCES.items():
+        feed = parse_rss_with_retry(url, tries=3)
+        entries = getattr(feed, "entries", None) or feed.get("entries", [])
+        for entry in entries:
+            dt = parse_entry_datetime(entry)
+            if not dt or dt < cutoff:
+                continue
+
+            title = (entry.get("title") or "").strip()
+            link  = (entry.get("link")  or "").strip()
+            raw_summary = entry.get("summary") or entry.get("description") or ""
+            summary = summarize_brief(raw_summary, MAX_SUMMARY_CHARS)
+
+            if not title or not link:
+                continue
+
+            # Filtres : bruit, IA obligatoire, intérêt militaire obligatoire
+            if is_noise(title, raw_summary):
+                continue
+            if REQUIRE_AI and not is_ai_related(title, raw_summary):
+                continue
+
+            mil_score, mil_cats, mil_ok = military_relevance(title, raw_summary)
+            if MIL_REQUIRED and not mil_ok:
+                continue
+
+            # Scoring & tags
+            score, level, tags = score_text(title, summary)
+            if mil_ok:
+                score += mil_score
+            if mil_ok and BOOST_DEFENSE:
+                score += BOOST_DEFENSE
+            level = "HIGH" if score >= 9 else "MEDIUM" if score >= 5 else "LOW"
+
+            collected.append({
+                "DateUTC": dt,
+                "Date": dt.strftime("%Y-%m-%d"),
+                "Source": source_name,
+                "Titre": title,
+                "Résumé": summary,
+                "Lien": link,
+                "Score": int(score),
+                "Niveau": level,
+                "Tags": ", ".join(tags + mil_cats) if tags or mil_cats else "",
+            })
+
+    # Déduplication + nettoyage
+    unique = []
+    for e in collected:
+        if not is_duplicate_article(e, unique):
+            unique.append(e)
+    entries = cleanup_old_entries(unique)
+
+    # DataFrame & tri
+    if entries:
+        df = pd.DataFrame(entries).sort_values(by=["Score", "DateUTC"], ascending=[False, False])
+    else:
+        df = pd.DataFrame(columns=["DateUTC","Date","Source","Titre","Résumé","Lien","Score","Niveau","Tags"])
+
+    # Rendu
+    generated_at = now_utc.strftime("%Y-%m-%d %H:%M UTC")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    # Santé simple
+    health = {
+        "generated_at": generated_at,
+        "counts_by_source": (df["Source"].value_counts().to_dict() if len(df) else {}),
+        "total": int(len(df)),
+        "window_days": int(MAX_ARTICLE_AGE_DAYS),
+    }
+    with open(os.path.join(OUT_DIR, "feed_health.json"), "w", encoding="utf-8") as f:
+        json.dump(health, f, ensure_ascii=False, indent=2)
+
+    generate_modern_html(df, generated_at, OUT_DIR, OUT_FILE)
+    print(f"✅ Généré {len(df)} items → {OUT_DIR}/{OUT_FILE}")
 
 if __name__ == "__main__":
     main()
