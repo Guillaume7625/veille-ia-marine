@@ -161,15 +161,33 @@ def main():
 
     generated_at = now_utc.strftime("%Y-%m-%d %H:%M UTC")
 
-    # HTML (Tailwind CDN)
-    rows_html = "\n".join(
-        f"<tr data-level='{r.get('Niveau','')}' data-source='{r.get('Source','')}'><td>{r.get('Date','')}</td>"
-        f"<td>{r.get('Source','')}</td><td>{r.get('Titre','')}</td><td>{r.get('Résumé','')}</td>"
-        f"<td>{int(r.get('Score',0))}</td><td><span class='px-2 py-1 rounded text-white {('bg-red-600' if r.get('Niveau')=='HIGH' else 'bg-orange-600' if r.get('Niveau')=='MEDIUM' else 'bg-green-600')}'>"
-        f"{r.get('Niveau','')}</span></td><td>{r.get('Tags','')}</td>"
-        f"<td><a href='{r.get('Lien','')}' target='_blank' class='text-blue-700 underline'>Lien</a></td></tr>"
-        for _, r in df.iterrows()
-    ) if total else "<tr><td colspan='8' class='text-center py-6'>Aucune entrée sur la période.</td></tr>"
+    # HTML (Tailwind CDN) — version sans f-string complexe
+    row_tpl = (
+        "<tr data-level='{level}' data-source='{source}'>"
+        "<td>{date}</td><td>{source}</td><td>{title}</td><td>{summary}</td>"
+        "<td>{score}</td><td><span class='px-2 py-1 rounded text-white {color}'>{level}</span></td>"
+        "<td>{tags}</td><td><a href='{link}' target='_blank' class='text-blue-700 underline'>Lien</a></td>"
+        "</tr>"
+    )
+
+    rows = []
+    for _, r in df.iterrows():
+        level = r["Niveau"]
+        color = "bg-red-600" if level == "HIGH" else "bg-orange-600" if level == "MEDIUM" else "bg-green-600"
+        rows.append(row_tpl.format(
+            level=level,
+            source=r["Source"],
+            date=r["Date"],
+            title=r["Titre"],
+            summary=r["Résumé"],
+            score=int(r["Score"]),
+            tags=r["Tags"],
+            link=r["Lien"],
+            color=color
+        ))
+    rows_html = "\n".join(rows) if rows else (
+        "<tr><td colspan='8' class='text-center py-6'>Aucune entrée sur la période.</td></tr>"
+    )
 
     html = f"""<!doctype html>
 <html lang="fr">
