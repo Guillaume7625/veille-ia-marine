@@ -1,17 +1,9 @@
-name: Maj veille IA Militaire
+name: Maj veille IA Marine (offline)
 
 on:
   schedule:
     - cron: "0 6 * * *"   # Tous les jours à 06:00 UTC
   workflow_dispatch:
-
-# Autorise le push vers gh-pages avec GITHUB_TOKEN
-permissions:
-  contents: write
-
-env:
-  DAYS_WINDOW: "30"            # Fenêtre glissante (en jours)
-  OFFLINE_TRANSLATION: "true"  # Traduction offline EN->FR
 
 jobs:
   build:
@@ -26,37 +18,49 @@ jobs:
         with:
           python-version: "3.11"
 
+      # <-- La modification est ici : requirements.txt lu dans .github/workflows/
       - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r .github/workflows/requirements.txt
 
-      # Cache des modèles Argos (~200 Mo max)
+      # Cache des modèles Argos (accélère les runs suivants)
       - name: Cache Argos models
-        id: cache-argos
         uses: actions/cache@v4
         with:
-          path: ~/.local/share/argos-translate/packages
-          key: argos-en-fr-model-v1
+          path: ~/.local/share/argos-translate
+          key: argos-${{ runner.os }}-v1
 
-      # Installe EN->FR si non présent en cache
+      # Installation du modèle EN -> FR pour Argos
       - name: Install Argos EN→FR model
-        if: steps.cache-argos.outputs.cache-hit != 'true'
         run: |
           python - <<'PY'
           from argostranslate import package
+          import os
+          os.makedirs(os.path.expanduser("~/.local/share/argos-translate/packages"), exist_ok=True)
           available = package.get_available_packages()
-          for p in available:
-              if p.from_code == "en" and p.to_code == "fr":
-                  package.install_from_path(p.download())
-                  print("Installed:", p)
-                  break
+          pkg = next((p for p in available if p.from_code == "en" and p.to_code == "fr"), None)
+          if pkg:
+              path = pkg.download()
+              package.install_from_path(path)
+          print("Argos EN->FR ready")
           PY
+
+      # (Optionnel) Cache du fichier de traduction si tu en utilises un local
+      - name: Cache translation map
+        uses: actions/cache@v4
+        with:
+          path: translation_cache.json
+          key: translation-cache-${{ github.run_id }}
+          restore-keys: |
+            translation-cache-
 
       - name: Run veille script
         env:
-          DAYS_WINDOW: ${{ env.DAYS_WINDOW }}
-          OFFLINE_TRANSLATION: ${{ env.OFFLINE_TRANSLATION }}
+          # Fenêtre glissante en jours (ex: 30)
+          DAYS_WINDOW: "30"
+          # Active la traduction offline
+          OFFLINE_TRANSLATION: "1"
         run: python veille_ia.py
 
       - name: Deploy to GitHub Pages
@@ -64,3 +68,6 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
+          # optionnel :
+          # user_name: github-actions[bot]
+          # user_email: 41898282+github-actions[bot]@users.noreply.github.com
