@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # <-- La modification est ici : requirements.txt lu dans .github/workflows/
+      # IMPORTANT : requirements.txt lu depuis .github/workflows/
       - name: Install requirements
         run: |
           python -m pip install --upgrade pip
@@ -31,7 +31,7 @@ jobs:
           path: ~/.local/share/argos-translate
           key: argos-${{ runner.os }}-v1
 
-      # Installation du modèle EN -> FR pour Argos
+      # Installer le modèle EN->FR (Argos)
       - name: Install Argos EN→FR model
         run: |
           python - <<'PY'
@@ -46,21 +46,18 @@ jobs:
           print("Argos EN->FR ready")
           PY
 
-      # (Optionnel) Cache du fichier de traduction si tu en utilises un local
-      - name: Cache translation map
-        uses: actions/cache@v4
-        with:
-          path: translation_cache.json
-          key: translation-cache-${{ github.run_id }}
-          restore-keys: |
-            translation-cache-
+      # (Optionnel) éviter que Jekyll ignore des fichiers
+      - name: Add .nojekyll
+        run: |
+          mkdir -p docs
+          touch docs/.nojekyll
 
       - name: Run veille script
         env:
-          # Fenêtre glissante en jours (ex: 30)
-          DAYS_WINDOW: "30"
-          # Active la traduction offline
-          OFFLINE_TRANSLATION: "1"
+          DAYS_WINDOW: "30"           # Ajustable (7/30/60…)
+          OFFLINE_TRANSLATION: "1"    # Active la traduction EN->FR
+          RELEVANCE_MIN: "0.55"       # Seuil pertinence contextuelle
+          HALF_LIFE_DAYS: "15"        # Demi-vie fraîcheur
         run: python veille_ia.py
 
       - name: Deploy to GitHub Pages
@@ -68,6 +65,3 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
-          # optionnel :
-          # user_name: github-actions[bot]
-          # user_email: 41898282+github-actions[bot]@users.noreply.github.com
