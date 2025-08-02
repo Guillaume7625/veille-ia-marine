@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Veille IA – Marine nationale (full web, GitHub Actions + Pages) – Version Hardened
+Veille IA – Marine nationale (full web, GitHub Actions + Pages) – Version RSS Only
 - 7 jours glissants
 - Dédup (titre + lien)
 - Scoring "défense/marine"
 - UI Tailwind + filtres + stats + export CSV
-- Intégration optionnelle d'un endpoint JSON privé (ex. Genspark) via secrets GitHub
-  env: GEN_ENDPOINT, GEN_TOKEN (Bearer)
 Aucune télémétrie, aucun tracker tiers ajouté.
 """
+
 import os
 import re
 import json
@@ -20,7 +19,6 @@ from datetime import datetime, timezone, timedelta
 
 import feedparser
 import pandas as pd
-import urllib.request
 
 # ---------------- Configuration ----------------
 
@@ -101,63 +99,6 @@ def parse_entry_datetime(entry):
                 return ts.to_pydatetime()
     return None
 
-def parse_iso_or_epoch(s):
-    if s is None:
-        return None
-    # epoch
-    try:
-        v = float(s)
-        if v > 1e12:
-            v = v / 1000.0
-        return datetime.fromtimestamp(v, tz=timezone.utc)
-    except Exception:
-        pass
-    # ISO
-    ts = pd.to_datetime(s, utc=True, errors="coerce")
-    if pd.notnull(ts):
-        return ts.to_pydatetime()
-    return None
-
-def ingest_json_endpoint(endpoint: str, token: str | None, cutoff_utc: datetime):
-    if not endpoint:
-        return []
-    try:
-        req = urllib.request.Request(endpoint, headers={"User-Agent": "VeilleIA/1.0"})
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    except Exception as e:
-        print(f"[WARN] JSON endpoint fetch failed: {e}")
-        return []
-    items = payload
-    if isinstance(payload, dict):
-        for k in ("items", "data", "results"):
-            if k in payload and isinstance(payload[k], list):
-                items = payload[k]
-                break
-    if not isinstance(items, list):
-        return []
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        title = (it.get("title") or it.get("name") or "").strip()
-        link = (it.get("link") or it.get("url") or "").strip()
-        summary = strip_html((it.get("summary") or it.get("description") or ""))[:MAX_SUMMARY_CHARS]
-        date_s = it.get("published_at") or it.get("date") or it.get("timestamp") or it.get("created_at")
-        dt = parse_iso_or_epoch(date_s) or datetime.now(timezone.utc)
-        if dt < cutoff_utc or not title or not link:
-            continue
-        score, level, tags = score_text(title, summary)
-        out.append({
-            "DateUTC": dt, "Date": dt.strftime("%Y-%m-%d"),
-            "Source": "JSON Endpoint",
-            "Titre": title, "Résumé": summary, "Lien": link,
-            "Score": score, "Niveau": level, "Tags": ", ".join(tags)
-        })
-    return out
-
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     now_utc = datetime.now(timezone.utc)
@@ -165,7 +106,7 @@ def main():
 
     entries, seen = [], set()
 
-    # 1) RSS
+    # 1) RSS uniquement
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
@@ -190,12 +131,6 @@ def main():
                 "Source": source_title, "Titre": title, "Résumé": summary, "Lien": link,
                 "Score": score, "Niveau": level, "Tags": ", ".join(tags)
             })
-
-    # 2) Endpoint JSON optionnel (ex. Genspark)
-    endpoint = os.getenv("GEN_ENDPOINT", "").strip()
-    token = (os.getenv("GEN_TOKEN") or "").strip() or None
-    if endpoint:
-        entries += ingest_json_endpoint(endpoint, token, cutoff)
 
     # DataFrame & tri
     if entries:
