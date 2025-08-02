@@ -8,10 +8,8 @@ Veille IA – Marine nationale (full web, GitHub Actions + Pages) – Version RS
 - UI Tailwind + filtres + stats + export CSV
 Aucune télémétrie, aucun tracker tiers ajouté.
 """
-
 import os
 import re
-import json
 import unicodedata
 import calendar
 from hashlib import md5
@@ -44,7 +42,6 @@ OUT_DIR = "docs"
 OUT_FILE = "index.html"   # GitHub Pages servira docs/index.html
 MAX_SUMMARY_CHARS = 500
 
-# Scoring par mots-clés (accent-insensible)
 KEYWORDS_WEIGHTS = {
     "marine": 5, "naval": 5, "navire": 3, "frégate": 4, "sous-marin": 5, "maritime": 3,
     "armée": 3, "defense": 4, "défense": 4, "otan": 4, "nato": 4, "doctrine": 3,
@@ -77,7 +74,6 @@ def score_text(title: str, summary: str):
         if nk in txt:
             score += w
             tags.append(k)
-    # unique tags keeping order
     seen = set()
     tags = [t for t in tags if not (t in seen or seen.add(t))]
     level = "HIGH" if score >= 9 else "MEDIUM" if score >= 5 else "LOW"
@@ -106,7 +102,7 @@ def main():
 
     entries, seen = [], set()
 
-    # 1) RSS uniquement
+    # RSS fetch
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
@@ -132,7 +128,6 @@ def main():
                 "Score": score, "Niveau": level, "Tags": ", ".join(tags)
             })
 
-    # DataFrame & tri
     if entries:
         df = pd.DataFrame(entries).sort_values(by=["Score", "DateUTC"], ascending=[False, False])
     else:
@@ -144,7 +139,7 @@ def main():
     med  = int((df["Niveau"] == "MEDIUM").sum()) if total else 0
     low  = int((df["Niveau"] == "LOW").sum()) if total else 0
 
-    # JSON for CSV export
+    # Export data for CSV (as JS object)
     export_items = []
     for _, r in df.iterrows():
         export_items.append({
@@ -157,37 +152,35 @@ def main():
             "score": int(r.get("Score",0)),
             "tags": r.get("Tags",""),
         })
-    export_json = json.dumps(export_items, ensure_ascii=False)
+    export_json = str(export_items).replace("'", '"')
 
     generated_at = now_utc.strftime("%Y-%m-%d %H:%M UTC")
 
-    # HTML (Tailwind CDN) — version sans f-string complexe
+    # HTML (accolades JS doublées, pas de f-string imbriquée)
     row_tpl = (
         "<tr data-level='{level}' data-source='{source}'>"
         "<td>{date}</td><td>{source}</td><td>{title}</td><td>{summary}</td>"
         "<td>{score}</td><td><span class='px-2 py-1 rounded text-white {color}'>{level}</span></td>"
-        "<td>{tags}</td><td><a href='{link}' target='_blank' class='text-blue-700 underline'>Lien</a></td>"
-        "</tr>"
+        "<td>{tags}</td><td><a href='{link}' target='_blank' class='text-blue-700 underline'>Lien</a></td></tr>"
     )
 
-    rows = []
-    for _, r in df.iterrows():
-        level = r["Niveau"]
-        color = "bg-red-600" if level == "HIGH" else "bg-orange-600" if level == "MEDIUM" else "bg-green-600"
-        rows.append(row_tpl.format(
-            level=level,
-            source=r["Source"],
-            date=r["Date"],
-            title=r["Titre"],
-            summary=r["Résumé"],
-            score=int(r["Score"]),
-            tags=r["Tags"],
-            link=r["Lien"],
-            color=color
-        ))
-    rows_html = "\n".join(rows) if rows else (
-        "<tr><td colspan='8' class='text-center py-6'>Aucune entrée sur la période.</td></tr>"
-    )
+    def get_row(r):
+        color = "bg-red-600" if r.get("Niveau") == "HIGH" else "bg-orange-600" if r.get("Niveau") == "MEDIUM" else "bg-green-600"
+        return row_tpl.format(
+            level=r.get("Niveau",""),
+            source=r.get("Source",""),
+            date=r.get("Date",""),
+            title=r.get("Titre",""),
+            summary=r.get("Résumé",""),
+            score=int(r.get("Score",0)),
+            color=color,
+            tags=r.get("Tags",""),
+            link=r.get("Lien",""),
+        )
+    if total:
+        rows_html = "\n".join(get_row(r) for _, r in df.iterrows())
+    else:
+        rows_html = "<tr><td colspan='8' class='text-center py-6'>Aucune entrée sur la période.</td></tr>"
 
     html = f"""<!doctype html>
 <html lang="fr">
@@ -294,7 +287,7 @@ function applyFilters() {{
 document.getElementById("btnCsv").addEventListener("click", () => {{
   const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Tags"];
   const rows = data.map(a => [a.titre, a.lien, a.date, a.source, a.resume, a.niveau, a.score, a.tags]);
-  const csv = [header, ...rows].map(r => r.map(x => `"${(x||"").replace(/"/g,'""')}"`).join(",")).join("\\n");
+  const csv = [header, ...rows].map(r => r.map(x => '"' + String(x||"").replace(/"/g,'""') + '"').join(",")).join("\\n");
   const blob = new Blob([csv], {{type: "text/csv;charset=utf-8"}});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
