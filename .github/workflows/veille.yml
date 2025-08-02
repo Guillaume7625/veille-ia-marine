@@ -2,12 +2,15 @@ name: Maj veille IA Marine (hardened)
 
 on:
   schedule:
-    - cron:  "0 6 * * *"   # Tous les jours à 06:00 UTC
+    - cron: "0 6 * * *"     # Tous les jours à 06:00 UTC
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Fenêtre de veille : 7 / 14 / 30 / 60 / 90
+      DAYS_WINDOW: "30"
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +22,40 @@ jobs:
       - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          pip install feedparser pandas
+          pip install -r .github/workflows/requirements.txt
+
+      # Cache des modèles Argos (réutilisés entre runs)
+      - name: Cache Argos models
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argos-${{ runner.os }}-enfr-v1
+
+      # Installe le modèle EN→FR si absent (offline)
+      - name: Install Argos EN→FR model
+        run: |
+          python - <<'PY'
+          import argostranslate.package as pkg
+          installed = {(p.from_code, p.to_code) for p in pkg.get_installed_packages()}
+          if ("en","fr") not in installed:
+              avail = pkg.get_available_packages()
+              enf = [p for p in avail if p.from_code=="en" and p.to_code=="fr"]
+              if enf:
+                  path = enf[0].download()
+                  pkg.install_from_path(path)
+                  print("Installed Argos EN→FR.")
+              else:
+                  print("No EN→FR package found.")
+          else:
+              print("Argos EN→FR already installed.")
+          PY
+
+      # Cache persistant pour la map de traductions (offline)
+      - name: Cache translation map
+        uses: actions/cache@v4
+        with:
+          path: .cache/translations.json
+          key: translations-${{ runner.os }}-v1
 
       - name: Run script veille IA
         env:
