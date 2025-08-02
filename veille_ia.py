@@ -1,103 +1,108 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Veille IA – Militaire (full web, GitHub Actions + Pages) – Version Hardened
-- Fenêtre glissante paramétrable (env DAYS_WINDOW)
-- Filtrage strict: tout doit concerner l'IA + intérêt militaire (combat & soutien)
-- Dédup (titre + lien + similarité)
-- Résumés FR automatiques (offline Argos EN→FR) + badge
-- UI Tailwind : filtres (recherche, niveau, source, période) + stats + export CSV
-- Déploiement statique dans docs/index.html
-Aucune télémétrie, aucun tracker tiers.
+Veille IA – Militaire / Marine (Full Web, GitHub Actions + Pages)
+- Fenêtre glissante paramétrable (DAYS_WINDOW, défaut 30 jours)
+- Filtrage obligatoire IA + pertinence militaire (combat/ISR, soutien, C2, cyber, spatial, marine…)
+- Déduplication (hash + similarité)
+- Résumés FR courts (avec traduction offline Argos si dispo)
+- UI Tailwind + filtres + export CSV (corrigé sans template string JS)
+- Déploiement vers GitHub Pages (docs/index.html)
+Aucune télémétrie.
 """
 
 import os
 import re
 import json
 import html
+import time
+import math
 import unicodedata
 import calendar
 from hashlib import md5
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
-from pathlib import Path
 
 import feedparser
 import pandas as pd
 
-# ------------------------------------------------------------
+# =========================================================
 # Configuration
-# ------------------------------------------------------------
+# =========================================================
 
-# Feeds principalement IA + défense/cyber/naval
+DAYS_WINDOW = int(os.getenv("DAYS_WINDOW", "30"))  # période d’analyse glissante
+OUT_DIR = "docs"
+OUT_FILE = "index.html"
+MAX_SUMMARY_FR_CHARS = 400  # longueur résumés FR
+OFFLINE_TRANSLATION = os.getenv("OFFLINE_TRANSLATION", "true").lower() in {"1", "true", "yes"}
+ARGOS_FROM_LANG = "en"
+ARGOS_TO_LANG = "fr"
+
+# Filtrage
+REQUIRE_AI = True          # un article doit parler d’IA (titre+résumé)
+MIL_REQUIRED = True        # et être pertinent côté défense/marine/cyber etc.
+BOOST_DEFENSE = 2          # bonus si militaire pertinent
+
+# Fichiers de cache (facultatif)
+TRANSLATION_CACHE_FILE = "translation_cache.json"
+
+# =========================================================
+# Sources RSS
+# =========================================================
+
 RSS_FEEDS = [
-    # IA FR
-    "https://www.actuia.com/feed/",
+    # FR / Tech
     "https://www.numerama.com/feed/",
-    # IA EN (qualité)
+    "https://www.actuia.com/feed/",
+    # EN / AI & Defense
     "https://venturebeat.com/category/ai/feed/",
-    "https://spectrum.ieee.org/rss/topic/artificial-intelligence",
-    # Défense / Naval / Cyber
     "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
     "https://breakingdefense.com/feed/",
     "https://www.naval-technology.com/feed/",
-    "https://www.cybersecuritydive.com/feeds/news/",
 ]
 
-DAYS_WINDOW = int(os.getenv("DAYS_WINDOW", "30"))
-OUT_DIR = "docs"
-OUT_FILE = "index.html"
-MAX_SUMMARY_CHARS_RAW = 800  # tronque le résumé source avant traitement
+# =========================================================
+# Vocabulaires
+# =========================================================
 
-# Exigences de contenu
-REQUIRE_AI = True
-MIL_REQUIRED = True
-
-# Scoring mots-clés (accent-insensible)
-KEYWORDS_WEIGHTS = {
-    # IA
-    "intelligence artificielle": 3, "ia": 3, "ai ": 3, "ai-": 3, "gpt": 2, "llm": 2,
-    "agent": 2, "agents": 2, "vision": 1, "autonome": 2, "autonomous": 2,
-    "machine learning": 2, "deep learning": 2, "ml ": 2, "nlp": 1, "predictif": 1, "predictive": 1,
-
-    # Défense/Militaire générique
-    "defense": 3, "défense": 3, "armée": 3, "forces": 2, "otan": 2, "nato": 2,
-
-    # Cyber/C2
-    "cyber": 3, "cybersécurité": 3, "cybersecurity": 3, "c2": 2, "command and control": 2,
-    "c4isr": 3, "ew": 2, "guerre électronique": 3, "electronic warfare": 3,
-
-    # Naval/Marine
-    "marine": 3, "naval": 3, "navy": 3, "frégate": 2, "sous-marin": 3, "aéronaval": 3,
-
-    # ISR/Capteurs/Plateformes
-    "isr": 2, "reconnaissance": 2, "radar": 2, "sonar": 2, "uav": 3, "drone": 3,
-
-    # Spatial/Comms
-    "satellite": 2, "satcom": 2, "constellation": 1,
+AI_HINTS = {
+    "ai", "artificial intelligence", "intelligence artificielle",
+    "machine learning", "deep learning", "gpt", "genai",
+    "neural", "modèle", "model", "inference", "agent",
+    "multi-agent", "computer vision", "nlp", "llm", "rlhf",
 }
 
-# Thématiques militaires (catégorisation "utile aux forces")
-CATS = {
+# Catégories militaires (tags sémantiques)
+MIL_CATEGORIES = {
     "Marine": {"marine", "naval", "navy", "frégate", "sous-marin", "aéronaval"},
-    "Cyber": {"cyber", "cybersécurité", "cybersecurity", "ransomware", "zero-day", "dfir"},
-    "Combat/ISR": {"isr", "targeting", "kill chain", "sensor fusion", "uav", "drone",
-                   "radar", "sonar", "ew", "guerre électronique", "electronic warfare"},
-    "Soutien/Logistique": {"maintenance", "logistique", "supply chain", "additive manufacturing",
-                           "mro", "prognostic", "predictive"},
-    "C2/Commandement": {"c2", "c4isr", "command", "control", "interoperability", "joint"},
-    "Spatial": {"satellite", "satcom", "constellation", "space force", "orbit", "oisl"},
+    "Cyber": {"cyber", "cybersecurity", "cybersécurité", "ransomware", "soc", "cisa"},
+    "Combat/ISR": {"drone", "uav", "ew", "guerre électronique", "isr", "reconnaissance",
+                   "missile", "manpads", "sam", "kill chain", "targeting"},
+    "Soutien/Logistique": {"maintenance", "logistics", "supply", "mco", "additive manufacturing"},
+    "C2/Commandement": {"c2", "command", "datalink", "interoperability", "joint", "multi-domain"},
+    "Spatial": {"satellite", "space force", "starlink", "constellation"},
 }
 
-# Traduction offline (Argos EN→FR)
-OFFLINE_TRANSLATION = True
-ARGOS_FROM_LANG = "en"
-ARGOS_TO_LANG = "fr"
-TRANSLATION_CACHE_FILE = ".cache/translations.json"
+# Pondérations (scoring simple)
+KEYWORDS_WEIGHTS = {
+    "marine": 4, "naval": 4, "navy": 4, "frégate": 4, "sous-marin": 5, "aéronaval": 5,
+    "défense": 4, "defense": 4, "otan": 4, "nato": 4, "armée": 3,
+    "cyber": 4, "ransomware": 3, "soc": 3,
+    "drone": 4, "uav": 4, "ew": 4, "guerre électronique": 5, "isr": 4,
+    "satellite": 3, "space force": 3,
+    "c2": 3, "commandement": 3, "joint": 2, "multi-domain": 3,
+}
 
-# ------------------------------------------------------------
-# Utilitaires texte
-# ------------------------------------------------------------
+# Bruit à écarter (gaming pur, deals, lifestyle…)
+NOISE_TERMS = {
+    "jeux vidéo", "gameplay", "deal du jour", "meilleur prix", "précommander",
+    "série netflix", "prime video", "battlefield", "nintendo", "playstation", "xbox",
+    "bons plans", "promo", "cinéma", "tests jeux",
+}
+
+# =========================================================
+# Utilitaires texte / dates
+# =========================================================
 
 def strip_html(text: str) -> str:
     if not text:
@@ -118,62 +123,13 @@ def detect_language_simple(text: str) -> str:
     if not text:
         return "unknown"
     t = text.lower()
-    fr_markers = [' le ', ' la ', ' les ', ' un ', ' une ', ' des ', ' du ', ' de ', ' et ', ' est ', ' sont ']
-    en_markers = [' the ', ' and ', ' are ', ' was ', ' were ', ' with ', ' from ', ' that ', ' this ']
-    fr = sum(m in t for m in fr_markers)
-    en = sum(m in t for m in en_markers)
-    return "fr" if fr > en else "en" if en > fr else "unknown"
-
-# ------------------------------------------------------------
-# Filtrage IA + intérêt militaire
-# ------------------------------------------------------------
-
-AI_HINTS = {
-    "intelligence artificielle", "ia", " ai", "gpt", "llm", "agent", "agents",
-    "machine learning", "deep learning", "ml ", "nlp", "autonome", "autonomous",
-    "computer vision", "predictif", "predictive", "genai", "generative"
-}
-
-def is_ai_related(title: str, summary: str) -> bool:
-    txt = normalize(f"{title} {summary}")[:2000]
-    return any(h in txt for h in AI_HINTS)
-
-def military_relevance(title: str, summary: str):
-    """Retourne (score_boost, list_categories, ok)"""
-    txt = normalize(f"{title} {summary}")
-    cats = []
-    score = 0
-    for cat, keys in CATS.items():
-        if any(normalize(k) in txt for k in keys):
-            cats.append(cat)
-    if cats:
-        # bonus de base + petit bonus si >1 catégories
-        score = 3 + max(0, len(cats) - 1)
-        ok = True
-    else:
-        ok = False
-    return score, cats, ok
-
-# ------------------------------------------------------------
-# Scoring générique
-# ------------------------------------------------------------
-
-def score_text(title: str, summary: str):
-    txt = normalize(f"{title or ''} {summary or ''}")
-    tags, score = [], 0
-    for k, w in KEYWORDS_WEIGHTS.items():
-        if normalize(k) in txt:
-            score += w
-            tags.append(k)
-    # tags uniques
-    seen = set()
-    tags = [t for t in tags if not (t in seen or seen.add(t))]
-    level = "HIGH" if score >= 12 else "MEDIUM" if score >= 6 else "LOW"
-    return score, level, tags
-
-# ------------------------------------------------------------
-# Dates RSS
-# ------------------------------------------------------------
+    fr = sum(1 for m in (" le ", " la ", " les ", " des ", " une ", " un ", " que ", " est ", " sont ", " avec ") if m in t)
+    en = sum(1 for m in (" the ", " and ", " are ", " was ", " with ", " from ", " this ", " that ", " which ") if m in t)
+    if fr > en:
+        return "fr"
+    if en > fr:
+        return "en"
+    return "unknown"
 
 def parse_entry_datetime(entry):
     for attr in ("published_parsed", "updated_parsed"):
@@ -191,207 +147,236 @@ def parse_entry_datetime(entry):
                 return ts.to_pydatetime()
     return None
 
-# ------------------------------------------------------------
-# Déduplication
-# ------------------------------------------------------------
+# =========================================================
+# Traduction offline (Argos) + cache
+# =========================================================
 
-def generate_content_hash(title: str, link: str, summary: str) -> str:
-    normalized_title = normalize(title)
-    normalized_link = link.strip().lower()
-    normalized_summary = normalize(summary[:120])
-    content = f"{normalized_title}|{normalized_link}|{normalized_summary}"
-    return md5(content.encode("utf-8")).hexdigest()[:16]
+def load_translation_cache():
+    try:
+        if os.path.exists(TRANSLATION_CACHE_FILE):
+            with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_translation_cache(cache: dict):
+    try:
+        with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _cache_key(text: str) -> str:
+    return md5(("en2fr|" + text).encode("utf-8")).hexdigest()
+
+def init_argos_translator():
+    if not OFFLINE_TRANSLATION:
+        return None
+    try:
+        import argostranslate.package as argos_package
+        import argostranslate.translate as argos_translate
+        # Les modèles sont installés par le workflow; ici on récupère la paire
+        for lang in argos_translate.get_installed_languages():
+            if lang.code == ARGOS_FROM_LANG:
+                for to_lang in lang.translations:
+                    if to_lang.code == ARGOS_TO_LANG:
+                        return argos_translate
+    except Exception:
+        return None
+    return None
+
+_ARGOS = None
+_TRANS_CACHE = load_translation_cache()
+
+def translate_offline_en_to_fr(text: str) -> str:
+    global _ARGOS, _TRANS_CACHE
+    if not text:
+        return ""
+    if not OFFLINE_TRANSLATION:
+        return text
+    if detect_language_simple(text) != "en":
+        return text
+
+    key = _cache_key(text)
+    if key in _TRANS_CACHE:
+        return _TRANS_CACHE[key]
+
+    if _ARGOS is None:
+        _ARGOS = init_argos_translator()
+        if _ARGOS is None:
+            return text
+
+    try:
+        translated = _ARGOS.translate(text, ARGOS_FROM_LANG, ARGOS_TO_LANG)
+        if translated and translated != text:
+            _TRANS_CACHE[key] = translated
+            save_translation_cache(_TRANS_CACHE)
+            return translated
+    except Exception:
+        pass
+    return text
+
+# =========================================================
+# Filtrage IA / militaire / bruit
+# =========================================================
+
+def has_any(text: str, vocab: set) -> bool:
+    t = normalize(text)
+    return any(k in t for k in vocab)
+
+def is_ai_related(title: str, summary: str) -> bool:
+    t = normalize((title or "") + " " + (summary or ""))
+    return has_any(t, AI_HINTS)
+
+def military_relevance(title: str, summary: str):
+    """Retourne (score_bonus, liste_categories, ok_bool)."""
+    t = normalize((title or "") + " " + (summary or ""))
+    found = []
+    bonus = 0
+    for cat, vocab in MIL_CATEGORIES.items():
+        if has_any(t, vocab):
+            found.append(cat)
+            bonus += 2
+    ok = len(found) > 0
+    return bonus, found, ok
+
+def is_noise(title: str, summary: str) -> bool:
+    t = normalize((title or "") + " " + (summary or ""))
+    return has_any(t, NOISE_TERMS)
+
+# =========================================================
+# Scoring / dédup
+# =========================================================
+
+def score_text(title: str, summary: str):
+    t = normalize((title or "") + " " + (summary or ""))
+    score = 0
+    tags = []
+    for k, w in KEYWORDS_WEIGHTS.items():
+        nk = normalize(k)
+        if nk in t:
+            score += w
+            tags.append(k)
+    seen = set()
+    tags = [x for x in tags if not (x in seen or seen.add(x))]
+    level = "HIGH" if score >= 9 else "MEDIUM" if score >= 5 else "LOW"
+    return score, level, tags
+
+def generate_content_hash(title: str, summary: str) -> str:
+    base = normalize(title) + "|" + normalize(summary[:100])
+    return md5(base.encode("utf-8")).hexdigest()[:12]
 
 def calculate_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def is_duplicate_article(new_entry: dict, entries: list, threshold: float = 0.92) -> bool:
-    h = new_entry["hash"]
-    if any(h == e["hash"] for e in entries):
-        return True
-    for e in entries:
-        if calculate_similarity(new_entry["title"], e["title"]) > threshold:
+def is_duplicate_article(new_entry: dict, existing_entries: list, thr: float = 0.85) -> bool:
+    h = generate_content_hash(new_entry["Titre"], new_entry["Résumé"])
+    for ex in existing_entries:
+        if h == generate_content_hash(ex["Titre"], ex["Résumé"]):
+            return True
+        if calculate_similarity(new_entry["Titre"], ex["Titre"]) > thr:
+            return True
+        if new_entry.get("Lien") and ex.get("Lien") and new_entry["Lien"] == ex["Lien"]:
             return True
     return False
 
-# ------------------------------------------------------------
-# Traduction offline Argos + cache
-# ------------------------------------------------------------
+# =========================================================
+# Résumés FR
+# =========================================================
 
-_translation_cache = None
-_argos_ready = False
-
-def _ensure_cache_dir():
-    Path(".cache").mkdir(parents=True, exist_ok=True)
-
-def load_translation_cache():
-    global _translation_cache
-    if _translation_cache is not None:
-        return _translation_cache
-    _ensure_cache_dir()
-    p = Path(TRANSLATION_CACHE_FILE)
-    if p.exists():
-        try:
-            _translation_cache = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            _translation_cache = {}
-    else:
-        _translation_cache = {}
-    return _translation_cache
-
-def save_translation_cache():
-    try:
-        _ensure_cache_dir()
-        Path(TRANSLATION_CACHE_FILE).write_text(
-            json.dumps(load_translation_cache(), ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-    except Exception as e:
-        print(f"[WARN] Unable to save translation cache: {e}")
-
-def _hash_text(s: str) -> str:
-    return md5((s or "").encode("utf-8")).hexdigest()
-
-def init_argos_translator() -> bool:
-    global _argos_ready
-    if _argos_ready:
-        return True
-    try:
-        import argostranslate.package as pkg
-        if ("en", "fr") in {(p.from_code, p.to_code) for p in pkg.get_installed_packages()}:
-            _argos_ready = True
-            return True
-        print("[WARN] Argos EN→FR model not installed.")
-        return False
-    except Exception as e:
-        print(f"[WARN] Argos init failed: {e}")
-        return False
-
-def translate_offline_en_to_fr(text: str) -> str:
-    if not text or not OFFLINE_TRANSLATION:
-        return text
-    cache = load_translation_cache()
-    h = _hash_text(text)
-    if h in cache:
-        return cache[h]
-    if not init_argos_translator():
-        cache[h] = text
-        return text
-    try:
-        import argostranslate.translate as argt
-        tr = argt.translate(text, ARGOS_FROM_LANG, ARGOS_TO_LANG)
-        if tr and tr != text:
-            cache[h] = tr
-            return tr
-    except Exception as e:
-        print(f"[WARN] Offline translation failed: {e}")
-    cache[h] = text
-    return text
-
-def generate_french_summary(raw_text: str) -> tuple:
+def summarize_fr(raw_text: str) -> tuple:
     """
-    Génère un résumé court FR. Retour: (summary_fr, is_translated, detected_lang)
+    Retourne (summary_fr, is_translated, detected_lang)
+    - si contenu EN: traduction offline (si dispo), sinon texte d’origine
+    - résumé = 2 phrases max, tronqué
     """
-    if not raw_text:
+    txt = strip_html(raw_text or "")
+    if not txt:
         return "", False, "unknown"
 
-    clean = re.sub(r"<[^>]+>", " ", raw_text)
-    clean = re.sub(r"\s+", " ", clean).strip()
-    clean = clean[:MAX_SUMMARY_CHARS_RAW]
+    lang = detect_language_simple(txt)
+    is_tr = False
 
-    det = detect_language_simple(clean)
-    # extractif : 2 phrases
-    sentences = re.split(r"(?<=[.!?])\s+", clean)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-    core = " ".join(sentences[:2]) if sentences else clean
+    if lang == "en":
+        t2 = translate_offline_en_to_fr(txt)
+        if t2 != txt:
+            txt = t2
+            is_tr = True
+        else:
+            # pas de trad dispo; on gardera en EN
+            pass
 
-    translated = False
-    if det == "en" and OFFLINE_TRANSLATION:
-        tr = translate_offline_en_to_fr(core)
-        if tr and tr != core:
-            core = tr
-            translated = True
+    # split en phrases FR/EN basique
+    sents = re.split(r'(?<=[\.\!\?])\s+', txt)
+    sents = [s.strip() for s in sents if len(s.strip()) > 10]
+    summary = " ".join(sents[:2]) if sents else txt[:MAX_SUMMARY_FR_CHARS]
 
-    if len(core) > 280:
-        core = core[:279].rsplit(" ", 1)[0] + "…"
+    if len(summary) > MAX_SUMMARY_FR_CHARS:
+        summary = summary[:MAX_SUMMARY_FR_CHARS-1].rsplit(" ", 1)[0] + "…"
 
-    return core, translated, det
+    return summary, is_tr, lang
 
-# ------------------------------------------------------------
+# =========================================================
 # HTML
-# ------------------------------------------------------------
+# =========================================================
 
-def build_html(df: pd.DataFrame, generated_at: str):
+def build_html(df: pd.DataFrame, generated_at: str) -> str:
     total = len(df)
     high = int((df["Niveau"] == "HIGH").sum()) if total else 0
-    sources_count = df["Source"].nunique() if total else 0
-    translated_count = int(df.get("Traduit", pd.Series([False]*total)).sum()) if total else 0
+    sources_count = len(set(df["Source"])) if total else 0
+    translated_count = int(df.get("Traduit", pd.Series(dtype=bool)).sum()) if total else 0
 
-    # lignes
-    def level_color(level: str) -> str:
-        if level == "HIGH":
-            return "bg-red-600"
-        if level == "MEDIUM":
-            return "bg-orange-600"
-        return "bg-green-600"
-
-    row_tpl = (
-        "<tr data-level='{level}' data-source='{source}' data-date='{date}'>"
-        "<td class='p-3 text-sm text-gray-600'>{date}</td>"
-        "<td class='p-3'><span class='bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-xs font-medium'>{source}</span></td>"
-        "<td class='p-3'><a href='{link}' target='_blank' class='text-blue-700 hover:text-blue-900 font-semibold hover:underline block'>{title}</a></td>"
-        "<td class='p-3 text-sm text-gray-700 summary-cell' title='{summary_raw_esc}'>{summary}{badge}</td>"
-        "<td class='p-3 text-center'><span class='bg-indigo-100 text-indigo-800 px-3 py-1 rounded-full text-sm font-bold'>{score}</span></td>"
-        "<td class='p-3 text-center'><span class='px-2 py-1 rounded text-white {color}'>{level}</span></td>"
-        "<td class='p-3 text-sm'>{tags}</td>"
-        "</tr>"
-    )
-
-    rows = []
-    for _, r in df.iterrows():
-        badge = " <span class='translation-badge text-white px-2 py-1 rounded text-xs ml-1'>🇫🇷 Traduit</span>" if r.get("Traduit") else ""
-        rows.append(
-            row_tpl.format(
-                level=r.get("Niveau",""),
-                source=r.get("Source",""),
-                date=r.get("Date",""),
-                link=r.get("Lien",""),
-                title=r.get("Titre",""),
-                summary=html.escape(r.get("Résumé","")),
-                summary_raw_esc=html.escape(r.get("Résumé brut","") or r.get("Résumé","")),
-                badge=badge,
-                score=int(r.get("Score",0)),
-                color=level_color(r.get("Niveau","")),
-                tags=html.escape(r.get("Tags","")),
+    # Lignes du tableau
+    if total:
+        rows = []
+        for _, r in df.iterrows():
+            rows.append(
+                f"<tr class='hover:bg-gray-50' data-level='{r.get('Niveau','')}' data-source='{html.escape(r.get('Source',''))}'>"
+                f"<td class='p-3 text-sm text-gray-600'>{r.get('Date','')}</td>"
+                f"<td class='p-3 text-sm'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded-full'>{html.escape(r.get('Source',''))}</span></td>"
+                f"<td class='p-3'><a href='{html.escape(r.get('Lien',''))}' target='_blank' "
+                f"class='text-blue-700 hover:underline font-semibold'>{html.escape(r.get('Titre',''))}</a></td>"
+                f"<td class='p-3 text-sm text-gray-700' title='{html.escape(r.get('Résumé',''))}'>"
+                f"{html.escape(r.get('Résumé',''))}"
+                + (" <span class='ml-2 text-xs px-2 py-1 rounded text-white' style='background:#6d28d9'>🇫🇷 Traduit</span>" if r.get("Traduit") else "") +
+                "</td>"
+                f"<td class='p-3 text-center'><span class='px-2 py-1 bg-indigo-100 text-indigo-800 rounded-full text-sm font-bold'>{int(r.get('Score',0))}</span></td>"
+                f"<td class='p-3 text-center'>"
+                f"<span class='px-2 py-1 rounded-full text-white text-xs font-bold "
+                + ("bg-red-600" if r.get("Niveau")=="HIGH" else "bg-orange-600" if r.get("Niveau")=="MEDIUM" else "bg-green-600")
+                + f"'>{r.get('Niveau','')}</span></td>"
+                f"<td class='p-3 text-sm text-gray-600'>{html.escape(r.get('Tags',''))}</td>"
+                "</tr>"
             )
-        )
-    rows_html = "\n".join(rows) if rows else "<tr><td colspan='7' class='text-center py-6'>Aucune entrée pour la période.</td></tr>"
+        rows_html = "\n".join(rows)
+    else:
+        rows_html = "<tr><td colspan='7' class='p-6 text-center text-gray-500'>Aucune entrée sur la période.</td></tr>"
 
-    html_out = f"""<!doctype html>
+    # f-string : toutes les accolades JS/CSS doivent être doublées {{ }}
+    html_page = f"""<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Veille IA – Militaire</title>
+<title>Veille IA Militaire</title>
 <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
 <style>
-  .gradient-bg {{ background: linear-gradient(135deg, #1e3a8a 0%, #3730a3 100%); }}
   .summary-cell {{
     max-height: 4.5rem; overflow: hidden; display: -webkit-box;
     -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.5;
   }}
-  .translation-badge {{ background: linear-gradient(45deg, #7c3aed, #5b21b6); }}
 </style>
 </head>
 <body class="bg-gray-50">
-<header class="gradient-bg text-white py-6">
-  <div class="max-w-6xl mx-auto px-4 flex items-center justify-between">
+<header class="bg-blue-900 text-white">
+  <div class="max-w-6xl mx-auto px-4 py-6 flex items-center justify-between">
     <div class="flex items-center gap-3">
       <span class="text-2xl">⚓</span>
       <div>
-        <h1 class="text-2xl font-bold">Veille IA – Militaire</h1>
+        <h1 class="text-2xl font-bold">Veille IA Militaire</h1>
         <div class="text-blue-200 text-sm">Fenêtre {DAYS_WINDOW} jours • Généré : {generated_at}</div>
       </div>
     </div>
@@ -400,48 +385,41 @@ def build_html(df: pd.DataFrame, generated_at: str):
 </header>
 
 <main class="max-w-6xl mx-auto px-4 py-6">
+  <!-- Stats -->
   <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
     <div class="bg-white rounded shadow p-4 text-center">
       <div class="text-3xl font-bold text-blue-700">{total}</div>
-      <div class="text-gray-600">Articles</div>
+      <div class="text-gray-600">Articles analysés</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
       <div class="text-3xl font-bold text-red-600">{high}</div>
       <div class="text-gray-600">Priorité Haute</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-blue-700">{sources_count}</div>
+      <div class="text-3xl font-bold text-green-600">{sources_count}</div>
       <div class="text-gray-600">Sources actives</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-purple-700">{translated_count}</div>
+      <div class="text-3xl font-bold text-purple-600">{translated_count}</div>
       <div class="text-gray-600">Articles traduits</div>
     </div>
   </div>
 
+  <!-- Filtres -->
   <div class="bg-white rounded shadow p-4 mb-4">
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-      <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…"
-             class="border rounded px-3 py-2">
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…" class="border rounded px-3 py-2">
       <select id="level" class="border rounded px-3 py-2">
         <option value="">Niveau (tous)</option>
         <option value="HIGH">HIGH</option>
         <option value="MEDIUM">MEDIUM</option>
         <option value="LOW">LOW</option>
       </select>
-      <input id="source" type="search" placeholder="Filtrer par source…"
-             class="border rounded px-3 py-2">
-      <select id="days" class="border rounded px-3 py-2">
-        <option value="0">Période (toutes)</option>
-        <option value="7">7 jours</option>
-        <option value="14">14 jours</option>
-        <option value="30" selected>30 jours</option>
-        <option value="60">60 jours</option>
-        <option value="90">90 jours</option>
-      </select>
+      <input id="source" type="search" placeholder="Filtrer par source…" class="border rounded px-3 py-2">
     </div>
   </div>
 
+  <!-- Tableau -->
   <div class="bg-white rounded shadow overflow-x-auto">
     <table class="min-w-full">
       <thead class="bg-blue-50">
@@ -463,66 +441,74 @@ def build_html(df: pd.DataFrame, generated_at: str):
 </main>
 
 <script>
-const rows   = Array.from(document.querySelectorAll("#tbody tr"));
-const q      = document.getElementById("q");
-const level  = document.getElementById("level");
-const source = document.getElementById("source");
-const days   = document.getElementById("days");
+(function() {{
+  const rows = Array.from(document.querySelectorAll("#tbody tr"));
+  const q = document.getElementById("q");
+  const level = document.getElementById("level");
+  const source = document.getElementById("source");
 
-function withinPeriod(tr, daysBack) {{
-  if (!daysBack || daysBack === "0") return true;
-  const d = tr.getAttribute("data-date");
-  if (!d) return true;
-  const rowTime = new Date(d + "T00:00:00Z").getTime();
-  const now     = Date.now();
-  const delta   = (now - rowTime) / (1000 * 3600 * 24);
-  return delta <= parseInt(daysBack, 10);
-}}
+  function applyFilters() {{
+    const qv = (q.value || "").toLowerCase();
+    const lv = level.value;
+    const sv = (source.value || "").toLowerCase();
+    rows.forEach(tr => {{
+      const t = tr.innerText.toLowerCase();
+      const rl = tr.getAttribute("data-level") || "";
+      const rs = (tr.getAttribute("data-source") || "").toLowerCase();
+      let ok = true;
+      if (qv && !t.includes(qv)) ok = false;
+      if (lv && rl !== lv) ok = false;
+      if (sv && !rs.includes(sv)) ok = false;
+      tr.style.display = ok ? "" : "none";
+    }});
+  }}
+  [q, level, source].forEach(el => el.addEventListener("input", applyFilters));
 
-function applyFilters() {{
-  const qv = (q?.value || "").toLowerCase();
-  const lv = level?.value || "";
-  const sv = (source?.value || "").toLowerCase();
-  const dv = days?.value || "0";
-
-  rows.forEach(tr => {{
-    const t  = tr.innerText.toLowerCase();
-    const rl = tr.getAttribute("data-level") || "";
-    const rs = (tr.getAttribute("data-source") || "").toLowerCase();
-    let ok = true;
-
-    if (qv && !t.includes(qv)) ok = false;
-    if (lv && rl !== lv) ok = false;
-    if (sv && !rs.includes(sv)) ok = false;
-    if (!withinPeriod(tr, dv)) ok = false;
-
-    tr.style.display = ok ? "" : "none";
+  // Export CSV — sans template string JS pour éviter les f-strings Python
+  document.getElementById("btnCsv").addEventListener("click", () => {{
+    const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Tags"];
+    const table = document.querySelector("#tbody");
+    const data = [];
+    for (const tr of table.querySelectorAll("tr")) {{
+      if (tr.style.display === "none") continue;
+      const tds = tr.querySelectorAll("td");
+      if (tds.length < 7) continue;
+      const titre = tds[2].innerText.trim();
+      const lienA = tds[2].querySelector("a");
+      const lien = lienA ? lienA.getAttribute("href") : "";
+      const row = [
+        titre,
+        lien,
+        tds[0].innerText.trim(),
+        tds[1].innerText.trim(),
+        tds[3].innerText.trim(),
+        tds[5].innerText.trim(),
+        tds[4].innerText.trim(),
+        tds[6].innerText.trim()
+      ];
+      data.push(row);
+    }}
+    const csv = [header, ...data]
+      .map(r => r.map(x => '"' + String((x==null ? "" : x)).replace(/"/g,'""') + '"').join(","))
+      .join("\\n");
+    const blob = new Blob([csv], {{type: "text/csv;charset=utf-8"}});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "veille_ia_militaire.csv";
+    a.click();
+    URL.revokeObjectURL(url);
   }});
-}}
-[q, level, source, days].forEach(el => el && el.addEventListener("input", applyFilters));
-applyFilters();
-
-// Export CSV
-const data = {export_json};
-document.getElementById("btnCsv").addEventListener("click", () => {{
-  const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Tags"];
-  const rows = data.map(a => [a.titre, a.lien, a.date, a.source, a.resume, a.niveau, a.score, a.tags]);
-  const csv = [header, ...rows].map(r => r.map(x => `"${(x||"").replace(/"/g,'""')}"`).join(",")).join("\\n");
-  const blob = new Blob([csv], {{type: "text/csv;charset=utf-8"}});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = "veille_ia_militaire.csv"; a.click();
-  URL.revokeObjectURL(url);
-}});
+}})();
 </script>
 </body>
 </html>
 """
-    return html_out
+    return html_page
 
-# ------------------------------------------------------------
+# =========================================================
 # Main
-# ------------------------------------------------------------
+# =========================================================
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -536,83 +522,66 @@ def main():
         except Exception as e:
             print(f"[WARN] RSS parse failed: {url} -> {e}")
             continue
+
         source_title = feed.feed.get("title", url)
+        bucket = []
+
         for entry in feed.entries:
             dt = parse_entry_datetime(entry)
             if not dt or dt < cutoff:
                 continue
+
             title = (entry.get("title") or "").strip()
-            link  = (entry.get("link") or "").strip()
-            raw_summary = strip_html(entry.get("summary") or entry.get("description") or "")
+            link = (entry.get("link") or "").strip()
+            raw = entry.get("summary") or entry.get("description") or ""
+            raw = strip_html(raw)
+
             if not title or not link:
                 continue
-
-            # Filtrage : IA obligatoire
-            if REQUIRE_AI and not is_ai_related(title, raw_summary):
+            if is_noise(title, raw):
+                continue
+            if REQUIRE_AI and not is_ai_related(title, raw):
                 continue
 
-            # Pertinence militaire (combat + soutien)
-            mil_score, mil_cats, mil_ok = military_relevance(title, raw_summary)
+            mil_bonus, mil_cats, mil_ok = military_relevance(title, raw)
             if MIL_REQUIRED and not mil_ok:
                 continue
 
-            # Résumé FR (offline) + score
-            summary_fr, is_translated, _ = generate_french_summary(raw_summary)
-            base_score, level, tags = score_text(title, summary_fr)
-            score = base_score + mil_score
+            # Résumé FR
+            resume_fr, is_tr, lang = summarize_fr(raw)
 
-            level = "HIGH" if score >= 12 else "MEDIUM" if score >= 6 else "LOW"
-            cats_str = " | ".join(sorted(set(mil_cats)))
+            score, level, tags = score_text(title, resume_fr)
+            if mil_ok:
+                score += mil_bonus
+            if mil_ok and BOOST_DEFENSE:
+                score += BOOST_DEFENSE
+            level = "HIGH" if score >= 9 else "MEDIUM" if score >= 5 else "LOW"
 
-            h = generate_content_hash(title, link, summary_fr)
-            new = {
-                "DateUTC": dt,
-                "Date": dt.strftime("%Y-%m-%d"),
+            row = {
+                "DateUTC": dt, "Date": dt.strftime("%Y-%m-%d"),
                 "Source": source_title,
-                "Titre": title,
-                "Résumé": summary_fr,
-                "Résumé brut": raw_summary,
-                "Lien": link,
-                "Score": int(score),
-                "Niveau": level,
-                "Tags": cats_str,
-                "Traduit": bool(is_translated),
-                "hash": h,
+                "Titre": title, "Résumé": resume_fr, "Lien": link,
+                "Score": int(score), "Niveau": level,
+                "Tags": ", ".join(sorted(set(tags + mil_cats))),
+                "Traduit": bool(is_tr)
             }
-            if not is_duplicate_article(new, entries):
-                entries.append(new)
 
-    # DataFrame & tri
+            if not is_duplicate_article(row, bucket):
+                bucket.append(row)
+
+        entries.extend(bucket)
+        print(f"[INFO] {source_title}: {len(bucket)} articles retenus")
+
     if entries:
         df = pd.DataFrame(entries).sort_values(by=["Score", "DateUTC"], ascending=[False, False])
     else:
-        df = pd.DataFrame(columns=["DateUTC","Date","Source","Titre","Résumé","Résumé brut","Lien","Score","Niveau","Tags","Traduit","hash"])
+        df = pd.DataFrame(columns=["DateUTC","Date","Source","Titre","Résumé","Lien","Score","Niveau","Tags","Traduit"])
 
-    # Export JSON (pour CSV)
-    export_items = []
-    for _, r in df.iterrows():
-        export_items.append({
-            "titre": r.get("Titre",""),
-            "lien": r.get("Lien",""),
-            "date": r.get("Date",""),
-            "source": r.get("Source",""),
-            "resume": r.get("Résumé",""),
-            "niveau": r.get("Niveau",""),
-            "score": int(r.get("Score",0)),
-            "tags": r.get("Tags",""),
-        })
-    export_json = json.dumps(export_items, ensure_ascii=False)
-
-    # HTML
     generated_at = now_utc.strftime("%Y-%m-%d %H:%M UTC")
-    html_out = build_html(df, generated_at)
-    html_out = html_out.replace("{export_json}", export_json)
-
+    html_page = build_html(df, generated_at)
     with open(os.path.join(OUT_DIR, OUT_FILE), "w", encoding="utf-8") as f:
-        f.write(html_out)
-
-    save_translation_cache()
-    print(f"OK • {len(df)} articles • écrit : {OUT_DIR}/{OUT_FILE}")
+        f.write(html_page)
+    print(f"[OK] Généré: {OUT_DIR}/{OUT_FILE} — {len(df)} entrées")
 
 if __name__ == "__main__":
     main()
