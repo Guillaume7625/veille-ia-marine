@@ -3,78 +3,85 @@ name: build
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - "veille_ia.py"
+      - ".github/workflows/**"
+      - "docs/**"
   workflow_dispatch:
-
-permissions:
-  contents: write
-  pages: write
-  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
     env:
-      # Ajustables
-      DAYS_WINDOW: 60
-      RELEVANCE_MIN: "0.35"
-      OFFLINE_TRANSLATION: "1"
+      # ---- Paramètres de la veille ----
+      DAYS_WINDOW: "60"          # fenêtre glissante (jours)
+      RELEVANCE_MIN: "0.35"      # seuil de pertinence contextuelle
+      OFFLINE_TRANSLATION: "1"   # activer la traduction offline EN->FR
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # On laisse requirements.txt dans .github/workflows/
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install requirements (pinned)
         run: |
           python -m pip install --upgrade pip
-          echo "=== .github/workflows/requirements.txt ==="
-          cat .github/workflows/requirements.txt || true
-          pip install -r .github/workflows/requirements.txt
+          pip install --no-cache-dir -r .github/workflows/requirements.txt
 
-      # Cache des modèles Argos
       - name: Cache Argos models
         id: cache-argos
         uses: actions/cache@v4
         with:
-          path: argos_models_cache
+          path: ~/.local/share/argos-translate/packages
           key: Linux-argos-cache-v1
 
-      - name: Install Argos EN→FR model (fast test)
+      - name: Install Argos EN→FR model (idempotent via API)
         run: |
-          import os, pathlib, urllib.request, zipfile, shutil
-          base = pathlib.Path("argos_models_cache"); base.mkdir(exist_ok=True)
-          model_dir = base / "en_fr_1_9"
-          if not model_dir.exists():
-              print("⇣ Téléchargement modèle EN→FR…")
-              # Référentiel officiel des packages Argos 1.9
-              url = "https://github.com/argosopentech/argostranslate-models/raw/master/translate-en_fr-1_9.argosmodel"
-              pkg = base / "translate-en_fr-1_9.argosmodel"
-              urllib.request.urlretrieve(url, pkg)
-              model_dir.mkdir(exist_ok=True)
-              (model_dir / "translate-en_fr-1_9.argosmodel").write_bytes(pkg.read_bytes())
-          print("Test: essai")
+          python - <<'PY'
+          from argostranslate import package, translate
+
+          # Si déjà installé, on sort proprement
+          for p in package.get_installed_packages():
+              if p.from_code == "en" and p.to_code == "fr":
+                  print("✅ Modèle EN→FR déjà installé")
+                  raise SystemExit(0)
+
+          print("⇣ Téléchargement modèle EN→FR…")
+          package.update_package_index()
+          available = package.get_available_packages()
+          candidates = [p for p in available if p.from_code == "en" and p.to_code == "fr"]
+          if not candidates:
+              raise SystemExit("❌ Aucun package EN→FR disponible dans l’index Argos.")
+          # prend la version la plus récente si plusieurs
+          candidates.sort(key=lambda p: getattr(p, "version", ""), reverse=True)
+          pkg = candidates[0]
+          package.install_from_path(package.download_package(pkg))
+
+          # Smoke test
+          translate.load_installed_languages()
+          langs = translate.get_installed_languages()
+          en = next(l for l in langs if l.code == "en")
+          fr = next(l for l in langs if l.code == "fr")
+          tr = en.get_translation(fr)
+          print("Test:", tr.translate("test"))
           print("✅ Modèle Argos EN→FR installé")
-        shell: python
+          PY
 
       - name: Run veille script
         run: |
-          set -o pipefail
-          python veille_ia.py | tee debug_run.log
-
-      - name: Upload debug log
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-run-log
-          path: debug_run.log
+          python veille_ia.py
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
-          personal_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
-          publish_branch: gh-pages
