@@ -1,24 +1,18 @@
-name: Maj veille IA Marine
+name: build
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '30 6 * * *'     # tous les jours à 06:30 UTC
-  push:
-    branches: [ main ]
-
-permissions:
-  contents: write
+    - cron: "30 6 * * *"   # 06:30 UTC chaque jour
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     env:
-      DAYS_WINDOW: '45'
-      RELEVANCE_MIN: '0.50'
-      MAX_SUMMARY_FR_CHARS: '280'
-      OFFLINE_TRANSLATION: '1'
+      DAYS_WINDOW: "60"          # fenêtre élargie pour récupérer du contenu
+      RELEVANCE_MIN: "0.1"       # seuil de pertinence très bas pour debug
+      OFFLINE_TRANSLATION: "0"   # désactivée pour debug
+      MAX_SUMMARY_FR_CHARS: "280"
 
     steps:
       - name: Checkout
@@ -27,64 +21,20 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      # (debug facultatif)
-      - name: Show requirements (debug)
-        run: |
-          echo "=== .github/workflows/requirements.txt ==="
-          if [ -f .github/workflows/requirements.txt ]; then
-            sed -n '1,120p' .github/workflows/requirements.txt
-          else
-            echo "(absent)"
-          fi
-          echo "========================================="
-
-      # Installation robuste (sans dépendre du fichier)
-      - name: Install requirements (robust)
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          pip install 'feedparser==6.0.11' 'argostranslate==1.9.0'
-
-      # Cache des modèles Argos
-      - name: Cache Argos models
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/share/argos-translate
-          key: ${{ runner.os }}-argos-cache-v1
-
-      # Installe le modèle EN->FR depuis le catalogue officiel
-      - name: Install Argos EN→FR model
-        run: |
-          python - <<'PY'
-          from argostranslate import package, translate
-          # Met à jour l'index des paquets disponibles
-          try:
-              package.update_package_index()
-          except Exception as e:
-              print(f"[WARN] update_package_index: {e}")
-          # Sélectionne le pack EN->FR
-          available = package.get_available_packages()
-          en_fr = next(p for p in available if p.from_code == "en" and p.to_code == "fr")
-          print("⇣ Téléchargement modèle EN→FR…")
-          path = en_fr.download()
-          package.install_from_path(path)
-          # Force le chargement en mémoire dans 1.9.x
-          _ = translate.get_installed_languages()
-          # Petit test fumigène
-          print("Test:", translate.translate("test", "en", "fr"))
-          print("✅ Modèle Argos EN→FR installé")
-          PY
+          python -m pip install -r .github/workflows/requirements.txt
 
       - name: Run veille script
         run: |
           python veille_ia.py
 
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs
-          publish_branch: gh-pages
-          force_orphan: true
+          branch: gh-pages
+          folder: docs
+          clean: true
