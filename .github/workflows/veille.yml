@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Debug: afficher le contenu réel du requirements
+      # (debug facultatif)
       - name: Show requirements (debug)
         run: |
           echo "=== .github/workflows/requirements.txt ==="
@@ -44,7 +44,6 @@ jobs:
       - name: Install requirements (robust)
         run: |
           python -m pip install --upgrade pip
-          # Installe explicitement les libs requises :
           pip install 'feedparser==6.0.11' 'argostranslate==1.9.0'
 
       # Cache des modèles Argos
@@ -55,17 +54,26 @@ jobs:
             ~/.local/share/argos-translate
           key: ${{ runner.os }}-argos-cache-v1
 
-      # Installation Argos EN->FR via le catalogue officiel
+      # Installe le modèle EN->FR depuis le catalogue officiel
       - name: Install Argos EN→FR model
         run: |
           python - <<'PY'
           from argostranslate import package, translate
+          # Met à jour l'index des paquets disponibles
+          try:
+              package.update_package_index()
+          except Exception as e:
+              print(f"[WARN] update_package_index: {e}")
+          # Sélectionne le pack EN->FR
           available = package.get_available_packages()
           en_fr = next(p for p in available if p.from_code == "en" and p.to_code == "fr")
-          print(f"⇣ Téléchargement modèle EN→FR {en_fr.package_version}…")
+          print("⇣ Téléchargement modèle EN→FR…")
           path = en_fr.download()
           package.install_from_path(path)
-          translate.load_installed_packages()
+          # Force le chargement en mémoire dans 1.9.x
+          _ = translate.get_installed_languages()
+          # Petit test fumigène
+          print("Test:", translate.translate("test", "en", "fr"))
           print("✅ Modèle Argos EN→FR installé")
           PY
 
