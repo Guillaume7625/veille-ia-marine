@@ -1,9 +1,18 @@
-name: Maj veille IA Marine (offline)
+name: Build & Publish – Veille IA Militaire
 
 on:
   schedule:
     - cron: "0 6 * * *"   # Tous les jours à 06:00 UTC
   workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: veille-ia-militaire
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -18,50 +27,51 @@ jobs:
         with:
           python-version: "3.11"
 
-      # IMPORTANT : requirements.txt lu depuis .github/workflows/
       - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          pip install -r .github/workflows/requirements.txt
+          pip install -r requirements.txt
 
-      # Cache des modèles Argos (accélère les runs suivants)
-      - name: Cache Argos models
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/argos-translate
-          key: argos-${{ runner.os }}-v1
-
-      # Installer le modèle EN->FR (Argos)
       - name: Install Argos EN→FR model
         run: |
           python - <<'PY'
-          from argostranslate import package
-          import os
-          os.makedirs(os.path.expanduser("~/.local/share/argos-translate/packages"), exist_ok=True)
-          available = package.get_available_packages()
-          pkg = next((p for p in available if p.from_code == "en" and p.to_code == "fr"), None)
-          if pkg:
-              path = pkg.download()
+          from argostranslate import package, translate
+          package.update_package_index()
+          pkgs = package.get_available_packages()
+          en_fr = [p for p in pkgs if p.from_code == "en" and p.to_code == "fr"]
+          if en_fr:
+              path = en_fr[0].download()
               package.install_from_path(path)
-          print("Argos EN->FR ready")
+          translate.load_installed_packages()
+          print("Argos installed:", [(l.code, [t.code for t in l.translation_languages]) for l in translate.get_installed_languages()])
           PY
 
-      # (Optionnel) éviter que Jekyll ignore des fichiers
-      - name: Add .nojekyll
-        run: |
-          mkdir -p docs
-          touch docs/.nojekyll
-
-      - name: Run veille script
+      - name: Build site (veille_ia.py)
         env:
-          DAYS_WINDOW: "30"           # Ajustable (7/30/60…)
-          OFFLINE_TRANSLATION: "1"    # Active la traduction EN->FR
-          RELEVANCE_MIN: "0.55"       # Seuil pertinence contextuelle
-          HALF_LIFE_DAYS: "15"        # Demi-vie fraîcheur
-        run: python veille_ia.py
+          PYTHONUTF8: "1"
+          OFFLINE_TRANSLATION: "1"  # activer la traduction offline EN→FR
+          DAYS_WINDOW: "60"         # étendre la période (ajustable)
+          RELEVANCE_MIN: "0.50"     # seuil de pertinence (ajustable)
+          HALF_LIFE_DAYS: "20"      # fraîcheur (ajustable)
+          DEBUG_MODE: "1"           # mettre "0" pour désactiver debug
+        run: |
+          python veille_ia.py
 
-      - name: Deploy to GitHub Pages
+      - name: Upload debug artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-report
+          path: |
+            docs/debug.html
+            docs/debug_report.json
+          if-no-files-found: ignore
+
+      - name: Publish to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
+          publish_branch: gh-pages
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
