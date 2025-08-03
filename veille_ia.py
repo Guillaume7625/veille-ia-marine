@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Veille IA – Militaire (Marine)
+Veille IA – Militaire
 - Récupère des flux RSS IA / Défense / Naval / Cyber
-- Filtre (IA ∧ Défense) avec logique "bridge" par catégorie de source
-- Calcule un score de pertinence
-- Génère docs/index.html (table, filtres, export CSV)
+- Filtre STRICT: IA (OBLIGATOIRE) ∧ Défense/Naval/Cyber (OBLIGATOIRE)
+- Traduction EN→FR via Argos (si installé)
+- Score de pertinence + tableau HTML (docs/index.html)
 """
 
 import os
@@ -23,178 +23,88 @@ import requests
 import feedparser
 from dateutil import parser as date_parser
 
-
-# ========================= Configuration =========================
+# ---------------------- Configuration ----------------------
 
 @dataclass
 class Config:
-    days_window: int = int(os.getenv("DAYS_WINDOW", "60"))
-    relevance_min: float = float(os.getenv("RELEVANCE_MIN", "0.28"))
-    max_summary_chars: int = int(os.getenv("MAX_SUMMARY_CHARS", "300"))
-    offline_translation: bool = os.getenv("OFFLINE_TRANSLATION", "0") == "1"
+    days_window: int = int(os.getenv("DAYS_WINDOW", "45"))
+    relevance_min: float = float(os.getenv("RELEVANCE_MIN", "0.30"))
+    max_summary_chars: int = int(os.getenv("MAX_SUMMARY_CHARS", "320"))
+    offline_translation: bool = os.getenv("OFFLINE_TRANSLATION", "1") == "1"
     output_dir: Path = Path("docs")
     output_file: str = "index.html"
     request_timeout: int = 25
     max_retries: int = 3
-    user_agent: str = "VeilleIA-Military/2.1 (+https://github.com/Guillaume7625/veille-ia-marine)"
-
+    user_agent: str = "VeilleIA-Military/2.2 (+https://github.com/Guillaume7625/veille-ia-marine)"
 
 config = Config()
 
+# ---------------------- Sources RSS ------------------------
 
-# ========================= Sources RSS =========================
-
-# Chaque source possède: url, language, authority, category
-# category ∈ {"tech","business","defense","naval","cyber"}
 RSS_SOURCES: Dict[str, Dict] = {
     # IA / Tech FR
-    "ActuIA": {
-        "url": "https://www.actuia.com/feed/",
-        "language": "fr",
-        "authority": 1.00,
-        "category": "tech",
-    },
-    "Numerama": {
-        "url": "https://www.numerama.com/feed/",
-        "language": "fr",
-        "authority": 0.95,
-        "category": "tech",
-    },
-
+    "ActuIA":             {"url": "https://www.actuia.com/feed/",                     "language": "fr", "authority": 1.00, "category": "tech"},
+    "Numerama":           {"url": "https://www.numerama.com/feed/",                    "language": "fr", "authority": 0.95, "category": "tech"},
     # IA / Tech EN
-    "VentureBeat AI": {
-        "url": "https://venturebeat.com/category/ai/feed/",
-        "language": "en",
-        "authority": 1.05,
-        "category": "business",
-    },
-
+    "VentureBeat AI":     {"url": "https://venturebeat.com/category/ai/feed/",         "language": "en", "authority": 1.05, "category": "tech"},
     # Défense / Naval / Cyber EN
-    "C4ISRNet": {
-        "url": "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
-        "language": "en",
-        "authority": 1.15,
-        "category": "defense",
-    },
-    "Breaking Defense": {
-        "url": "https://breakingdefense.com/feed/",
-        "language": "en",
-        "authority": 1.15,
-        "category": "defense",
-    },
-    "Naval Technology": {
-        "url": "https://www.naval-technology.com/feed/",
-        "language": "en",
-        "authority": 1.10,
-        "category": "naval",
-    },
-    "Cybersecurity Dive": {
-        "url": "https://www.cybersecuritydive.com/feeds/news/",
-        "language": "en",
-        "authority": 1.05,
-        "category": "cyber",
-    },
+    "C4ISRNet":           {"url": "https://www.c4isrnet.com/arc/outboundfeeds/rss/",   "language": "en", "authority": 1.15, "category": "defense"},
+    "Breaking Defense":   {"url": "https://breakingdefense.com/feed/",                 "language": "en", "authority": 1.15, "category": "defense"},
+    "Naval Technology":   {"url": "https://www.naval-technology.com/feed/",            "language": "en", "authority": 1.10, "category": "naval"},
+    "Cybersecurity Dive": {"url": "https://www.cybersecuritydive.com/feeds/news/",     "language": "en", "authority": 1.05, "category": "cyber"},
 }
 
-
-# ========================= Vocabulaire (ancres + boosts) =========================
+# ---------------------- Vocabulaire ------------------------
 
 ANCHORS_AI = {
-    "ai", "intelligence artificielle", "artificial intelligence",
-    "machine learning", "apprentissage automatique", "deep learning",
-    "neural network", "réseau neuronal", "transformer",
-    "llm", "large language model", "foundation model", "model foundation",
-    "genai", "génératif", "diffusion", "inference", "inférence",
-    "computer vision", "nlp", "natural language processing",
-    "agent", "multi-agent", "autonomy", "autonomous", "autonome",
+    "ai","artificial intelligence","intelligence artificielle",
+    "machine learning","apprentissage automatique","deep learning",
+    "neural network","réseau neuronal","transformer","attention",
+    "foundation model","large language model","llm","genai","génératif",
+    "diffusion","stable diffusion","gan","embedding","vector",
+    "inference","inférence","fine-tuning","finetuning","prompt",
+    "reinforcement learning","apprentissage par renforcement","rl",
+    "supervised","unsupervised","self-supervised","auto-supervisé",
+    "computer vision","vision par ordinateur","nlp","traitement du langage",
+    "speech recognition","reconnaissance vocale","multimodal",
+    "agent","multi-agent","autonomy","autonomous","autonome",
+    "robotics","robotique","swarm","essaim","edge ai","edge inference",
+    "algorithm","algorithme","model","modèle","dataset","jeu de données",
+    "prediction","prédiction","classif","détection d'anomalies","anomaly detection",
 }
 
 ANCHORS_DEF = {
-    # Opérations / institutions
-    "defense", "défense", "defence", "military", "warfighter", "battlefield",
-    "nato", "otan", "dod", "department of defense", "mod", "ministry of defence",
-    "pentagon", "doctrine", "procurement", "acquisition",
-    "us navy", "royal navy", "air force", "space force", "army", "marines",
-    # C2 / ISR / GE
-    "c4isr", "isr", "c2", "command and control", "command & control",
-    "electronic warfare", "ew", "jamming", "sigint", "elint",
-    # Plateformes / armements
-    "naval", "marine", "navy", "frigate", "frégate", "destroyer",
-    "submarine", "sous-marin", "aircraft carrier", "porte-avions",
-    "drone", "uav", "uas", "uuv", "usv", "ucav", "loyal wingman",
-    "radar", "sonar", "missile", "hypersonic", "counter-uas", "counter uas",
-    "countermeasure", "contre-mesure",
-    # Cyber pilier défense
-    "cyber", "cybersécurité", "cybersecurity", "apt", "ransomware", "malware",
-    "phishing", "zero-day", "zeroday", "cve-", "xdr", "edr", "siem", "soc",
-    "cisa", "anssi", "cert", "ddos",
+    "defense","défense","defence","military","warfighter","battlefield",
+    "nato","otan","dod","department of defense","mod","ministry of defence",
+    "pentagon","us navy","royal navy","air force","space force","army","marines",
+    "procurement","acquisition","doctrine","concept of operations","conops",
+    "c4isr","isr","c2","command and control","command & control",
+    "electronic warfare","ew","jamming","sigint","elint","situational awareness",
+    "naval","marine","navy","frégate","frigate","destroyer",
+    "submarine","sous-marin","carrier","aircraft carrier","porte-avions",
+    "drone","uav","uas","uuv","usv","ucav","loyal wingman",
+    "radar","sonar","missile","hypersonic","counter-uas","counter uas",
+    "countermeasure","contre-mesure",
+    "cyber","cybersécurité","cybersecurity","apt","ransomware","malware",
+    "phishing","zero-day","zeroday","cve-","xdr","edr","siem","soc",
+    "cisa","anssi","cert","ddos",
 }
 
-# Boosts pondérés pour la pertinence
 SEMANTIC_KEYWORDS = {
-    "ai_core": {
-        "weight": 6,
-        "terms": [
-            "intelligence artificielle", "ai", "machine learning", "deep learning",
-            "neural network", "réseau neuronal", "transformer",
-            "foundation model", "llm", "génératif", "genai", "diffusion",
-            "inference", "inférence",
-        ],
-    },
-    "ai_apps": {
-        "weight": 4,
-        "terms": [
-            "computer vision", "vision", "nlp", "natural language processing",
-            "speech recognition", "reconnaissance vocale",
-            "multimodal", "agent", "multi-agent", "autonomous", "autonome",
-            "edge inference",
-        ],
-    },
-    "def_ops": {
-        "weight": 6,
-        "terms": [
-            "defense", "défense", "defence", "military", "nato", "otan", "dod", "mod",
-            "command and control", "c2", "isr", "c4isr",
-            "electronic warfare", "ew", "jamming", "warfighter", "battlefield",
-            "doctrine", "procurement", "acquisition",
-        ],
-    },
-    "def_platforms": {
-        "weight": 5,
-        "terms": [
-            "naval", "marine", "navy", "frégate", "frigate", "destroyer",
-            "sous-marin", "submarine", "porte-avions", "aircraft carrier",
-            "drone", "uav", "uas", "uuv", "usv", "ucav", "loyal wingman",
-            "radar", "sonar", "missile", "hypersonic", "counter-uas", "countermeasure",
-        ],
-    },
-    "cyber_def": {
-        "weight": 5,
-        "terms": [
-            "cyber", "cybersécurité", "cybersecurity", "apt", "ransomware", "malware",
-            "phishing", "zero-day", "zeroday", "cve-", "xdr", "edr", "siem", "soc",
-            "cisa", "anssi", "cert", "ddos",
-        ],
-    },
+    "ai_core":       {"weight": 6, "terms": list(ANCHORS_AI)},
+    "def_ops":       {"weight": 6, "terms": ["defense","défense","military","nato","otan","dod","mod","c2","isr","c4isr","electronic warfare","ew","jamming","warfighter","battlefield"]},
+    "def_platforms": {"weight": 5, "terms": ["naval","marine","navy","frégate","frigate","destroyer","sous-marin","submarine","porte-avions","aircraft carrier","drone","uav","uuv","usv","radar","sonar","missile"]},
+    "cyber_def":     {"weight": 5, "terms": ["cyber","cybersécurité","cybersecurity","apt","ransomware","malware","xdr","edr","soc","siem"]},
 }
 
-# Exclusions (grand public / divertissement / e-commerce)
 EXCLUSION_PATTERNS = [
     r"\b(deal|promo|bon\s?plan|réduction|discount|sale|prix|achat|pre[-\s]?order|pré[-\s]?commande)\b",
     r"\b(gaming|jeux?\s?vidéo|streaming|cinéma|people|célébrité|gossip)\b",
     r"\b(smartphone|iphone|android|tablet|gadget|wearable|earbuds?)\b",
     r"\b(disney\+|netflix|prime video|spotify|youtube|tiktok)\b",
-    r"\b(métro|resto|voyage|tourisme|loisirs)\b",
 ]
 
-# Whitelist (laisse passer si défense/ops fort, même si un mot d'exclusion apparaît)
-EXCLUSION_WHITELIST = {
-    "c4isr", "isr", "command and control", "c2", "warfighter", "battlefield",
-    "nato", "otan", "dod", "mod", "pentagon", "us navy", "royal navy",
-}
-
-
-# ========================= Logging =========================
+# ---------------------- Logging ----------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -203,8 +113,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ========================= Modèle Article =========================
+# ---------------------- Modèle -----------------------------
 
 @dataclass
 class Article:
@@ -230,8 +139,7 @@ class Article:
         import hashlib
         return hashlib.md5(f"{self.title}|{self.link}".encode()).hexdigest()
 
-
-# ========================= Utilitaires texte =========================
+# ---------------------- Utils texte ------------------------
 
 class TextProcessor:
     @staticmethod
@@ -264,19 +172,16 @@ class TextProcessor:
               ' what ', ' can ', ' will ', ' would ', ' should ', ' have ', ' has ']
         f = sum(1 for m in fr if m in t)
         e = sum(1 for m in en if m in t)
-        if f > e:
-            return "fr"
-        if e > f:
-            return "en"
+        if f > e: return "fr"
+        if e > f: return "en"
         return "unknown"
 
-
-# ========================= Traduction (facultatif) =========================
+# ---------------------- Traduction Argos -------------------
 
 class TranslationService:
-    """Traduction offline via Argos si installé. Sinon, laisse le texte tel quel."""
     def __init__(self):
         self.available = False
+        self._translation = None
         self._setup()
 
     def _setup(self) -> None:
@@ -284,15 +189,26 @@ class TranslationService:
             return
         try:
             from argostranslate import translate as argos_translate
+            from argostranslate import package as argos_package
             langs = argos_translate.get_installed_languages()
             en = next((l for l in langs if l.code == "en"), None)
             fr = next((l for l in langs if l.code == "fr"), None)
+            if not (en and fr):
+                argos_package.update_package_index()
+                available = argos_package.get_available_packages()
+                pkg = next((p for p in available if p.from_code == "en" and p.to_code == "fr"), None)
+                if pkg is not None:
+                    path = pkg.download()
+                    argos_package.install_from_path(path)
+                langs = argos_translate.get_installed_languages()
+                en = next((l for l in langs if l.code == "en"), None)
+                fr = next((l for l in langs if l.code == "fr"), None)
             if en and fr:
                 self._translation = en.get_translation(fr)
                 self.available = self._translation is not None
-                logger.info("✅ Argos EN→FR disponible")
+                logger.info("✅ Argos EN→FR prêt")
             else:
-                logger.warning("⚠️ Argos installé mais modèles EN/FR absents")
+                logger.warning("⚠️ Modèle EN→FR Argos introuvable")
         except Exception as e:
             logger.warning(f"⚠️ Argos indisponible: {e}")
             self.available = False
@@ -308,74 +224,47 @@ class TranslationService:
             logger.warning(f"Erreur traduction: {e}")
         return text, False
 
-
-# ========================= Analyseur contenu =========================
+# ---------------------- Analyseur --------------------------
 
 class ContentAnalyzer:
     def __init__(self):
         self.translator = TranslationService()
 
-    # --- détection ---
-    def _has_ai(self, text_norm: str) -> bool:
-        return any(k in text_norm for k in ANCHORS_AI)
+    def _has_ai(self, norm: str) -> bool:
+        return any(k in norm for k in ANCHORS_AI)
 
-    def _has_defense(self, text_norm: str) -> bool:
-        return any(k in text_norm for k in ANCHORS_DEF)
+    def _has_defense(self, norm: str) -> bool:
+        return any(k in norm for k in ANCHORS_DEF)
 
-    def _same_sentence_cooc(self, text: str) -> bool:
-        if not text:
-            return False
-        sents = re.split(r"(?<=[\.\!\?])\s+", text)
-        for s in sents:
-            t = TextProcessor.norm(s)
-            if any(a in t for a in ANCHORS_AI) and any(d in t for d in ANCHORS_DEF):
-                return True
-        return False
-
-    # --- scoring ---
-    def _keyword_score(self, text_norm: str) -> int:
+    def _keyword_score(self, norm: str) -> int:
         score = 0
-        # ancres IA / DEF valent 3 chacune (limitées pour éviter l'emballement)
-        score += min(10, 3 * sum(1 for k in ANCHORS_AI if k in text_norm))
-        score += min(10, 3 * sum(1 for k in ANCHORS_DEF if k in text_norm))
-        # boosts taxonomiques pondérés
+        score += min(12, 3 * sum(1 for k in ANCHORS_AI if k in norm))
+        score += min(12, 3 * sum(1 for k in ANCHORS_DEF if k in norm))
         for _, data in SEMANTIC_KEYWORDS.items():
             w = data["weight"]
             for term in data["terms"]:
-                if TextProcessor.norm(term) in text_norm:
+                if TextProcessor.norm(term) in norm:
                     score += w
         return score
 
-    def _relevance_score(self, article: Article, authority: float) -> float:
-        txt = TextProcessor.norm(f"{article.title} {article.summary}")
+    def _relevance_score(self, art: Article, authority: float) -> float:
+        txt = TextProcessor.norm(f"{art.title} {art.summary}")
         sem = 0.0
         for _, data in SEMANTIC_KEYWORDS.items():
             w = data["weight"]
             for term in data["terms"]:
                 if TextProcessor.norm(term) in txt:
                     sem += 0.1 * w
+        age_h = max(0.0, (datetime.now(timezone.utc) - art.date).total_seconds() / 3600.0)
+        fresh = max(0.5, 2 ** (-age_h / 72.0))  # demi-vie 3 jours
+        return max(0.0, min(1.5, (sem * authority * fresh) / 10.0))
 
-        # fraîcheur (demi-vie ~3 jours)
-        age_h = max(0.0, (datetime.now(timezone.utc) - article.date).total_seconds() / 3600.0)
-        freshness = max(0.5, 2 ** (-age_h / 72.0))
-
-        # bonus co-occurrence si même phrase
-        co = 1.0
-        if self._same_sentence_cooc(f"{article.title}. {article.summary}"):
-            co = 1.10
-
-        score = (sem * authority * freshness * co) / 10.0
-        return max(0.0, min(1.5, score))
-
-    # --- exclusion ---
-    def _is_excluded_noise(self, text_norm: str) -> bool:
+    def _is_excluded_noise(self, norm: str) -> bool:
         for pat in EXCLUSION_PATTERNS:
-            if re.search(pat, text_norm):
-                if not any(w in text_norm for w in EXCLUSION_WHITELIST):
-                    return True
+            if re.search(pat, norm):
+                return True
         return False
 
-    # --- date ---
     def _parse_date(self, entry) -> Optional[datetime]:
         for fld in ("published_parsed", "updated_parsed"):
             par = getattr(entry, fld, None)
@@ -395,51 +284,39 @@ class ContentAnalyzer:
                     pass
         return None
 
-    # --- pipeline article ---
     def process_entry(self, entry, src_name: str, meta: Dict) -> Optional[Article]:
         title = (entry.get("title") or "").strip()
         link = (entry.get("link") or "").strip()
-        raw = entry.get("summary") or entry.get("description") or ""
+        raw  = entry.get("summary") or entry.get("description") or ""
         if not title or not link:
             return None
 
         clean = TextProcessor.clean_html(raw)
         detected = TextProcessor.detect_language_simple(f"{title} {clean}")
 
-        # traduction EN -> FR si disponible
         summary = clean
         translated = False
         if meta.get("language") == "en" or detected == "en":
             summary, translated = self.translator.en_to_fr(clean)
 
-        # Limiter la taille du résumé
         if len(summary) > config.max_summary_chars:
             summary = summary[: config.max_summary_chars - 1].rsplit(" ", 1)[0] + "…"
 
-        # Date
         dt = self._parse_date(entry) or datetime.now(timezone.utc)
 
-        # Texte normalisé pour les tests/score
         full = f"{title} {summary}"
         norm = TextProcessor.norm(full)
 
-        # Exclusions bruit
         if self._is_excluded_noise(norm):
             return None
 
-        has_ai = self._has_ai(norm)
-        has_def = self._has_defense(norm)
-        is_def_source = meta.get("category") in ("defense", "naval", "cyber")
-        is_ai_source = meta.get("category") in ("tech", "business")
-
-        # Règle d'acceptation "bridge"
-        ok_pair = has_ai and has_def
-        ok_bridge_from_def = is_def_source and has_ai
-        ok_bridge_from_ai = is_ai_source and has_def
-        if not (ok_pair or ok_bridge_from_def or ok_bridge_from_ai):
+        # Filtre STRICT : IA ∧ Défense
+        if not self._has_ai(norm):
+            return None
+        if not self._has_defense(norm):
             return None
 
-        article = Article(
+        art = Article(
             title=title,
             link=link,
             summary=summary,
@@ -450,33 +327,26 @@ class ContentAnalyzer:
             category=meta.get("category", "GENERAL").upper(),
         )
 
-        article.keyword_score = self._keyword_score(norm)
-        article.relevance_score = self._relevance_score(article, meta.get("authority", 1.0))
+        art.keyword_score   = self._keyword_score(norm)
+        art.relevance_score = self._relevance_score(art, meta.get("authority", 1.0))
 
-        # Priorité simple
-        if article.keyword_score >= 18:
-            article.priority_level = "HIGH"
-        elif article.keyword_score >= 10:
-            article.priority_level = "MEDIUM"
+        if art.keyword_score >= 20:
+            art.priority_level = "HIGH"
+        elif art.keyword_score >= 11:
+            art.priority_level = "MEDIUM"
         else:
-            article.priority_level = "LOW"
+            art.priority_level = "LOW"
 
-        # Tags rapides
         tags = []
-        if "cyber" in norm or "ransomware" in norm:
-            tags.append("Cyber")
-        if "naval" in norm or "marine" in norm or "navy" in norm:
-            tags.append("Naval")
-        if "c4isr" in norm or "isr" in norm or "c2" in norm:
-            tags.append("C2/ISR")
-        if "llm" in norm or "génératif" in norm or "genai" in norm:
-            tags.append("Génératif/LLM")
-        article.tags = tags
+        if "cyber" in norm or "ransomware" in norm: tags.append("Cyber")
+        if "naval" in norm or "marine" in norm or "navy" in norm: tags.append("Naval")
+        if "c4isr" in norm or "isr" in norm or "c2" in norm: tags.append("C2/ISR")
+        if "llm" in norm or "génératif" in norm or "genai" in norm: tags.append("Génératif/LLM")
+        art.tags = tags
 
-        return article
+        return art
 
-
-# ========================= Collecteur RSS =========================
+# ---------------------- Collecte RSS -----------------------
 
 class RSSCollector:
     def __init__(self):
@@ -499,8 +369,7 @@ class RSSCollector:
         logging.error(f"Échec définitif {url}")
         return feedparser.FeedParserDict(feed={}, entries=[])
 
-
-# ========================= Générateur HTML =========================
+# ---------------------- HTML ------------------------------
 
 class HTMLGenerator:
     def __init__(self, articles: List[Article]):
@@ -707,8 +576,7 @@ class HTMLGenerator:
 </html>
 """
 
-
-# ========================= Orchestration =========================
+# ---------------------- Orchestration ----------------------
 
 def main():
     logger.info(f"CFG days_window={config.days_window} relevance_min={config.relevance_min} offline_translation={config.offline_translation}")
@@ -717,46 +585,35 @@ def main():
     analyzer = ContentAnalyzer()
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.days_window)
 
-    seen_hashes: Set[str] = set()
-    kept_articles: List[Article] = []
-    stats = {"seen": 0, "excluded": 0, "no_pair": 0, "too_old": 0, "low_rel": 0, "kept": 0}
+    seen: Set[str] = set()
+    kept: List[Article] = []
+    total_seen = 0
 
     for src_name, meta in RSS_SOURCES.items():
-        url = meta["url"]
-        feed = collector.fetch(url)
+        feed = collector.fetch(meta["url"])
         entries = getattr(feed, "entries", []) or []
         logger.info(f"Source {src_name}: {len(entries)} entrées")
-        for entry in entries:
-            stats["seen"] += 1
-            art = analyzer.process_entry(entry, src_name, meta)
+        total_seen += len(entries)
+        for e in entries:
+            art = analyzer.process_entry(e, src_name, meta)
             if not art:
-                stats["no_pair"] += 1
                 continue
             if art.date < cutoff:
-                stats["too_old"] += 1
                 continue
-            if art.hash_id in seen_hashes:
+            if art.hash_id in seen:
                 continue
-            # seuil de pertinence
             if art.relevance_score < config.relevance_min:
-                stats["low_rel"] += 1
                 continue
+            seen.add(art.hash_id)
+            kept.append(art)
 
-            seen_hashes.add(art.hash_id)
-            kept_articles.append(art)
-            stats["kept"] += 1
+    kept.sort(key=lambda a: (a.relevance_score, a.date, a.keyword_score), reverse=True)
 
-    # Tri: pertinence desc, date desc, score desc
-    kept_articles.sort(key=lambda a: (a.relevance_score, a.date, a.keyword_score), reverse=True)
-
-    # Génération HTML
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    page = HTMLGenerator(kept_articles).build()
-    (config.output_dir / config.output_file).write_text(page, encoding="utf-8")
+    html_page = HTMLGenerator(kept).build()
+    (config.output_dir / config.output_file).write_text(html_page, encoding="utf-8")
 
-    logger.info(f"[STATS] seen={stats['seen']} too_old={stats['too_old']} low_rel={stats['low_rel']} no_pair={stats['no_pair']} kept={stats['kept']}")
-    logger.info(f"✅ Rapport écrit dans {config.output_dir / config.output_file} – {len(kept_articles)} entrées")
-
+    logger.info(f"✅ Rapport écrit dans {config.output_dir / config.output_file} – {len(kept)} entrées / {total_seen} vues")
 
 if __name__ == "__main__":
     main()
