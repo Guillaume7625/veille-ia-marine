@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Veille IA – Militaire</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body class="bg-gray-50">
+  
+<header class="bg-blue-900 text-white">
+  <div class="max-w-7xl mx-auto px-4 py-6 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <span class="text-2xl">⚓</span>
+      <div>
+        <h1 class="text-2xl font-bold">Veille IA – Militaire</h1>
+        <div class="text-blue-200 text-sm">
+          Fenêtre 45 jours • Généré : 2025-08-03 20:18 UTC • Seuil pertinence : 0.3
+        </div>
+      </div>
+    </div>
+    <button id="btnCsv" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">Exporter CSV</button>
+  </div>
+</header>
+
+  
+<main class="max-w-7xl mx-auto px-4 py-6">
+  <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
+    <div class="bg-white rounded shadow p-4 text-center">
+      <div class="text-3xl font-bold text-blue-700">3</div>
+      <div class="text-gray-600">Articles</div>
+    </div>
+    <div class="bg-white rounded shadow p-4 text-center">
+      <div class="text-3xl font-bold text-red-600">3</div>
+      <div class="text-gray-600">Priorité Haute</div>
+    </div>
+    <div class="bg-white rounded shadow p-4 text-center">
+      <div class="text-3xl font-bold text-green-600">1</div>
+      <div class="text-gray-600">Sources actives</div>
+    </div>
+    <div class="bg-white rounded shadow p-4 text-center">
+      <div class="text-3xl font-bold text-purple-600">3</div>
+      <div class="text-gray-600">Traduit FR</div>
+    </div>
+    <div class="bg-white rounded shadow p-4 text-center">
+      <div class="text-sm text-gray-600">Pertinence moyenne</div>
+      <div class="text-xl font-semibold">0.356</div>
+    </div>
+  </div>
+
+  <div class="bg-white rounded shadow p-4 mb-4">
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…" class="border rounded px-3 py-2">
+      <select id="level" class="border rounded px-3 py-2">
+        <option value="">Niveau (tous)</option>
+        <option value="HIGH">HIGH</option>
+        <option value="MEDIUM">MEDIUM</option>
+        <option value="LOW">LOW</option>
+      </select>
+      <input id="source" type="search" placeholder="Filtrer par source…" class="border rounded px-3 py-2">
+      <select id="cat" class="border rounded px-3 py-2">
+        <option value="">Catégorie (toutes)</option>
+        <option value='POLICY'>POLICY</option><option value='TECHNOLOGY'>TECHNOLOGY</option>
+      </select>
+    </div>
+  </div>
+
+  
+  <div class="bg-white rounded shadow overflow-x-auto">
+    <table class="min-w-full">
+      <thead class="bg-blue-50">
+        <tr>
+          <th class="text-left p-3">Date</th>
+          <th class="text-left p-3">Source</th>
+          <th class="text-left p-3">Article</th>
+          <th class="text-left p-3">Résumé (FR)</th>
+          <th class="text-left p-3">Score</th>
+          <th class="text-left p-3">Niveau</th>
+          <th class="text-left p-3">Catégorie</th>
+          <th class="text-left p-3">Pertinence</th>
+          <th class="text-left p-3">Tags</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr class='hover:bg-gray-50' data-level='HIGH' data-source='Naval Technology' data-cat='POLICY'><td class='p-3 text-sm text-gray-600'>2025-07-30</td><td class='p-3 text-xs'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded'>Naval Technology</span></td><td class='p-3'><a class='text-blue-700 hover:underline font-semibold' target='_blank' href='https://www.naval-technology.com/news/gdeb-qinetiq-submarine-contrac/'>GDEB contracts QinetiQ for US Virginia and Columbia-class submarine components</a></td><td class='p-3 text-sm text-gray-800'>GDEB a octroyé des contrats de sous-traitance d&#x27;une valeur de 26 millions de dollars à la société de technologie de défense QinetiQ US pour des systèmes sous-marins. L&#x27;après GDEB contrats QinetiQ pour US Virginia et Columbia-class composants sous-marins est apparu en premier sur Naval Technology . <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span></td><td class='p-3 text-center'><span class='bg-indigo-100 text-indigo-800 px-2 py-1 rounded text-sm font-bold'>29</span></td><td class='p-3 text-center'><span class='text-white px-2 py-1 rounded text-xs bg-red-600'>HIGH</span></td><td class='p-3 text-sm'><span class='px-2 py-1 rounded text-white text-xs' style='background:#0f766e'>POLICY</span></td><td class='p-3 text-center text-sm'><span class='bg-gray-100 text-gray-800 px-2 py-1 rounded'>0.386</span></td><td class='p-3 text-sm'>Cybersécurité, Naval</td></tr><tr class='hover:bg-gray-50' data-level='HIGH' data-source='Naval Technology' data-cat='TECHNOLOGY'><td class='p-3 text-sm text-gray-600'>2025-08-01</td><td class='p-3 text-xs'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded'>Naval Technology</span></td><td class='p-3'><a class='text-blue-700 hover:underline font-semibold' target='_blank' href='https://www.naval-technology.com/news/us-navy-looks-to-additive-manufacturing-for-supply-chain-solution/'>US Navy looks to additive manufacturing for supply chain solution</a></td><td class='p-3 text-sm text-gray-800'>La marine américaine a installé un composant créé par la fabrication additive dans un destroyer de missiles guidé de classe Arleigh Burke. L&#x27;article US Navy vise la fabrication additive pour la solution de chaîne d&#x27;approvisionnement est apparu en premier sur Naval Technology . <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span></td><td class='p-3 text-center'><span class='bg-indigo-100 text-indigo-800 px-2 py-1 rounded text-sm font-bold'>22</span></td><td class='p-3 text-center'><span class='text-white px-2 py-1 rounded text-xs bg-red-600'>HIGH</span></td><td class='p-3 text-sm'><span class='px-2 py-1 rounded text-white text-xs' style='background:#0f766e'>TECHNOLOGY</span></td><td class='p-3 text-center text-sm'><span class='bg-gray-100 text-gray-800 px-2 py-1 rounded'>0.36</span></td><td class='p-3 text-sm'>Naval, Vision Artificielle</td></tr><tr class='hover:bg-gray-50' data-level='HIGH' data-source='Naval Technology' data-cat='POLICY'><td class='p-3 text-sm text-gray-600'>2025-08-01</td><td class='p-3 text-xs'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded'>Naval Technology</span></td><td class='p-3'><a class='text-blue-700 hover:underline font-semibold' target='_blank' href='https://www.naval-technology.com/news/us-navy-add-another-arleigh-burke-destroyer-to-multi-year-contract/'>US Navy add another Arleigh Burke destroyer to multi-year contract</a></td><td class='p-3 text-sm text-gray-800'>La Marine américaine a exercé une option pour un autre destroyer de classe Arleigh Burke dans son contrat pluriannuel attribué en 2023. Le post US Navy ajouter un autre destroyer Arleigh Burke au contrat pluriannuel est apparu en premier sur Naval Technology . <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span></td><td class='p-3 text-center'><span class='bg-indigo-100 text-indigo-800 px-2 py-1 rounded text-sm font-bold'>21</span></td><td class='p-3 text-center'><span class='text-white px-2 py-1 rounded text-xs bg-red-600'>HIGH</span></td><td class='p-3 text-sm'><span class='px-2 py-1 rounded text-white text-xs' style='background:#0f766e'>POLICY</span></td><td class='p-3 text-center text-sm'><span class='bg-gray-100 text-gray-800 px-2 py-1 rounded'>0.321</span></td><td class='p-3 text-sm'>Naval</td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+
+  
+<script>
+(function() {
+  const rows = Array.from(document.querySelectorAll("#tbody tr"));
+  const q = document.getElementById("q");
+  const level = document.getElementById("level");
+  const source = document.getElementById("source");
+  const cat = document.getElementById("cat");
+
+  function applyFilters() {
+    const qv = (q.value || "").toLowerCase();
+    const lv = level.value;
+    const sv = (source.value || "").toLowerCase();
+    const cv = cat.value;
+    rows.forEach(tr => {
+      const t = tr.innerText.toLowerCase();
+      const rl = tr.getAttribute("data-level") || "";
+      const rs = (tr.getAttribute("data-source") || "").toLowerCase();
+      const rc = tr.getAttribute("data-cat") || "";
+      let ok = true;
+      if (qv && !t.includes(qv)) ok = false;
+      if (lv && rl !== lv) ok = false;
+      if (sv && !rs.includes(sv)) ok = false;
+      if (cv && rc !== cv) ok = false;
+      tr.style.display = ok ? "" : "none";
+    });
+  }
+  [q, level, source, cat].forEach(el => el.addEventListener("input", applyFilters));
+
+  document.getElementById("btnCsv").addEventListener("click", () => {
+    const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Catégorie","Pertinence","Tags"];
+    const table = document.querySelector("#tbody");
+    const data = [];
+    for (const tr of table.querySelectorAll("tr")) {
+      if (tr.style.display === "none") continue;
+      const tds = tr.querySelectorAll("td");
+      if (tds.length < 9) continue;
+      const titre = tds[2].innerText.trim();
+      const lienA = tds[2].querySelector("a");
+      const lien = lienA ? lienA.getAttribute("href") : "";
+      const row = [
+        titre, lien,
+        tds[0].innerText.trim(),
+        tds[1].innerText.trim(),
+        tds[3].innerText.trim(),
+        tds[5].innerText.trim(),
+        tds[4].innerText.trim(),
+        tds[6].innerText.trim(),
+        tds[7].innerText.trim(),
+        tds[8].innerText.trim()
+      ];
+      data.push(row);
+    }
+    const csv = [header, ...data].map(r => r.map(x => '"' + String((x==null ? "" : x)).replace(/"/g,'""') + '"').join(",")).join("\n");
+    const blob = new Blob([csv], {type: "text/csv;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "veille_ia_militaire.csv"; a.click();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+
+</body>
+</html>
