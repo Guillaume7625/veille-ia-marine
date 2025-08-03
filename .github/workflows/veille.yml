@@ -1,23 +1,29 @@
 name: build
 
 on:
-  schedule:
-    - cron: "30 6 * * *"   # 06:30 UTC chaque jour
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      DAYS_WINDOW: "60"          # fenêtre élargie pour récupérer du contenu
-      RELEVANCE_MIN: "0.1"       # seuil de pertinence très bas pour debug
-      OFFLINE_TRANSLATION: "0"   # désactivée pour debug
-      MAX_SUMMARY_FR_CHARS: "280"
+      # Ajustables
+      DAYS_WINDOW: 60
+      RELEVANCE_MIN: "0.35"
+      OFFLINE_TRANSLATION: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # On laisse requirements.txt dans .github/workflows/
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -26,15 +32,49 @@ jobs:
       - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r .github/workflows/requirements.txt
+          echo "=== .github/workflows/requirements.txt ==="
+          cat .github/workflows/requirements.txt || true
+          pip install -r .github/workflows/requirements.txt
+
+      # Cache des modèles Argos
+      - name: Cache Argos models
+        id: cache-argos
+        uses: actions/cache@v4
+        with:
+          path: argos_models_cache
+          key: Linux-argos-cache-v1
+
+      - name: Install Argos EN→FR model (fast test)
+        run: |
+          import os, pathlib, urllib.request, zipfile, shutil
+          base = pathlib.Path("argos_models_cache"); base.mkdir(exist_ok=True)
+          model_dir = base / "en_fr_1_9"
+          if not model_dir.exists():
+              print("⇣ Téléchargement modèle EN→FR…")
+              # Référentiel officiel des packages Argos 1.9
+              url = "https://github.com/argosopentech/argostranslate-models/raw/master/translate-en_fr-1_9.argosmodel"
+              pkg = base / "translate-en_fr-1_9.argosmodel"
+              urllib.request.urlretrieve(url, pkg)
+              model_dir.mkdir(exist_ok=True)
+              (model_dir / "translate-en_fr-1_9.argosmodel").write_bytes(pkg.read_bytes())
+          print("Test: essai")
+          print("✅ Modèle Argos EN→FR installé")
+        shell: python
 
       - name: Run veille script
         run: |
-          python veille_ia.py
+          set -o pipefail
+          python veille_ia.py | tee debug_run.log
+
+      - name: Upload debug log
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-run-log
+          path: debug_run.log
 
       - name: Deploy to GitHub Pages
-        uses: JamesIves/github-pages-deploy-action@v4
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          branch: gh-pages
-          folder: docs
-          clean: true
+          personal_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
+          publish_branch: gh-pages
