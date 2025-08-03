@@ -2,26 +2,14 @@ name: build
 
 on:
   push:
-    branches: [ "main" ]
-    paths:
-      - "veille_ia.py"
-      - ".github/workflows/**"
-      - "docs/**"
+    branches: ["main"]
+  schedule:
+    - cron: "17 */6 * * *"   # toutes les 6h
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pages: write
-      id-token: write
-
-    env:
-      # ---- Paramètres de la veille ----
-      DAYS_WINDOW: "60"          # fenêtre glissante (jours)
-      RELEVANCE_MIN: "0.35"      # seuil de pertinence contextuelle
-      OFFLINE_TRANSLATION: "1"   # activer la traduction offline EN->FR
 
     steps:
       - name: Checkout
@@ -32,56 +20,72 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requirements (pinned)
+      - name: Show requirements
+        run: |
+          echo "=== .github/workflows/requirements.txt ==="
+          cat .github/workflows/requirements.txt || true
+          echo "========================================="
+
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r .github/workflows/requirements.txt
+          pip install -r .github/workflows/requirements.txt
 
       - name: Cache Argos models
-        id: cache-argos
         uses: actions/cache@v4
         with:
-          path: ~/.local/share/argos-translate/packages
+          path: ~/.local/share/argos-translate
           key: Linux-argos-cache-v1
 
-      - name: Install Argos EN→FR model (idempotent via API)
+      - name: Install Argos EN→FR model (if missing)
         run: |
           python - <<'PY'
-          from argostranslate import package, translate
-
-          # Si déjà installé, on sort proprement
-          for p in package.get_installed_packages():
-              if p.from_code == "en" and p.to_code == "fr":
-                  print("✅ Modèle EN→FR déjà installé")
-                  raise SystemExit(0)
-
-          print("⇣ Téléchargement modèle EN→FR…")
-          package.update_package_index()
-          available = package.get_available_packages()
-          candidates = [p for p in available if p.from_code == "en" and p.to_code == "fr"]
-          if not candidates:
-              raise SystemExit("❌ Aucun package EN→FR disponible dans l’index Argos.")
-          # prend la version la plus récente si plusieurs
-          candidates.sort(key=lambda p: getattr(p, "version", ""), reverse=True)
-          pkg = candidates[0]
-          package.install_from_path(package.download_package(pkg))
-
-          # Smoke test
-          translate.load_installed_languages()
-          langs = translate.get_installed_languages()
-          en = next(l for l in langs if l.code == "en")
-          fr = next(l for l in langs if l.code == "fr")
-          tr = en.get_translation(fr)
-          print("Test:", tr.translate("test"))
-          print("✅ Modèle Argos EN→FR installé")
+          import sys
+          from pathlib import Path
+          print("⇣ Vérification/installation modèle Argos EN→FR…")
+          try:
+              import argostranslate.package as pkg
+              import argostranslate.translate as tr
+              # déjà installé ?
+              langs = tr.get_installed_languages()
+              en = next((l for l in langs if l.code=="en"), None)
+              fr = next((l for l in langs if l.code=="fr"), None)
+              if en and fr:
+                  print("✅ Modèle déjà installé")
+                  sys.exit(0)
+              # sinon installer via l'index officiel
+              pkg.update_package_index()
+              available = pkg.get_available_packages()
+              pair = next((p for p in available if p.from_code=="en" and p.to_code=="fr"), None)
+              if not pair:
+                  raise RuntimeError("Pair en→fr introuvable dans l'index Argos")
+              path = pair.download()
+              pkg.install_from_path(path)
+              print("✅ Modèle Argos EN→FR installé")
+          except Exception as e:
+              print(f"⚠️ Impossible d'installer le modèle EN→FR : {e}")
+              # on ne fail pas : le pipeline continue, la trad sera désactivée
+              pass
           PY
 
-      - name: Run veille script
+      - name: Run veille
+        env:
+          DAYS_WINDOW: "45"            # fenêtre glissante (jours)
+          RELEVANCE_MIN: "0.40"        # seuil de pertinence (0–1)
+          OFFLINE_TRANSLATION: "1"     # 1 = activer la traduction EN→FR
+          MAX_SUMMARY_CHARS: "300"
         run: |
           python veille_ia.py
 
+      - name: Upload artifact (rapport)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-html
+          path: docs/index.html
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
+        if: ${{ github.ref == 'refs/heads/main' }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs
+          publish_dir: docs
