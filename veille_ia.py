@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Veille IA – Militaire (Marine) – full web, offline FR summaries, scoring contextuel
+Veille IA – Militaire (Marine) – full web, offline FR summaries, scoring contextuel, DEBUG
 - Fenêtre glissante configurable (DAYS_WINDOW)
 - Filtrage strict: IA OBLIGATOIRE + Défense/Marine/Cyber OBLIGATOIRE
 - Déduplication (titre|lien)
 - Traduction offline EN→FR via Argos (si OFFLINE_TRANSLATION=1)
 - Scoring contextuel (densité, co-occurrence IA+DEF, autorité source, fraîcheur)
 - Catégorisation avancée + tags intelligents
-- UI Tailwind + filtres (niveau, source, catégorie) + export CSV
-- Sortie: docs/index.html (pour GitHub Pages)
+- UI Tailwind + filtres + export CSV
+- DEBUG: rapports docs/debug.html + docs/debug_report.json
 
 Dépendances : feedparser, argostranslate
 """
@@ -132,6 +132,87 @@ SOURCE_WEIGHTS = {
     "ActuIA": 1.00,
 }
 
+# ========================== DEBUG MODE ==========================
+
+DEBUG_MODE = os.getenv("DEBUG_MODE", "0") in {"1", "true", "True"}
+DBG = {
+    "sources": {},  # métriques par source
+    "totals": {"fetched":0,"date_ok":0,"ai_ok":0,"def_ok":0,"not_noise":0,"dedup_ok":0,"relevance_ok":0,"kept":0}
+}
+
+def dbg_init_source(src):
+    if src not in DBG["sources"]:
+        DBG["sources"][src] = {
+            "fetched":0,"date_ok":0,"ai_ok":0,"def_ok":0,
+            "not_noise":0,"dedup_ok":0,"relevance_ok":0,"kept":0,
+            "drops": {
+                "too_old":0,"noise":0,"no_ai":0,"no_def":0,
+                "duplicate":0,"low_relevance":0,"missing_fields":0
+            },
+            "drop_samples": []  # [(raison, titre)]
+        }
+
+def dbg_tick(src, key, inc=1):
+    if not DEBUG_MODE: return
+    dbg_init_source(src)
+    DBG["sources"][src][key] += inc
+    if key in DBG["totals"]:
+        DBG["totals"][key] += inc
+
+def dbg_drop(src, reason, title):
+    if not DEBUG_MODE: return
+    dbg_init_source(src)
+    DBG["sources"][src]["drops"][reason] += 1
+    if len(DBG["sources"][src]["drop_samples"]) < 12:
+        DBG["sources"][src]["drop_samples"].append((reason, (title or "")[:140]))
+
+def dbg_write():
+    if not DEBUG_MODE: return
+    os.makedirs(OUT_DIR, exist_ok=True)
+    import json
+    with open(os.path.join(OUT_DIR, "debug_report.json"), "w", encoding="utf-8") as f:
+        json.dump(DBG, f, ensure_ascii=False, indent=2)
+
+    # Mini rapport HTML
+    rows = []
+    for src, d in DBG["sources"].items():
+        rows.append(
+            f"<tr><td class='p-2'>{htmllib.escape(src)}</td>"
+            f"<td class='p-2 text-right'>{d['fetched']}</td>"
+            f"<td class='p-2 text-right'>{d['kept']}</td>"
+            f"<td class='p-2 text-right'>{d['drops']['no_ai']}</td>"
+            f"<td class='p-2 text-right'>{d['drops']['no_def']}</td>"
+            f"<td class='p-2 text-right'>{d['drops']['noise']}</td>"
+            f"<td class='p-2 text-right'>{d['drops']['low_relevance']}</td>"
+            f"<td class='p-2 text-right'>{d['drops']['too_old']}</td>"
+            f"<td class='p-2 text-right'>{d['drops']['duplicate']}</td></tr>"
+        )
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet"></head>
+<body class="p-6">
+<h1 class="text-xl font-bold mb-4">Rapport debug</h1>
+<p class="mb-4">Fenêtre: {DAYS_WINDOW} jours • Seuil pertinence: {RELEVANCE_MIN} • Demi-vie: {HALF_LIFE_DAYS} jours</p>
+<table class="min-w-full bg-white shadow rounded">
+<thead class="bg-blue-50"><tr>
+<th class="p-2 text-left">Source</th><th class="p-2 text-right">Récupérés</th><th class="p-2 text-right">Gardés</th>
+<th class="p-2 text-right">drop no_ai</th><th class="p-2 text-right">drop no_def</th>
+<th class="p-2 text-right">drop noise</th><th class="p-2 text-right">drop low_rel</th>
+<th class="p-2 text-right">drop too_old</th><th class="p-2 text-right">drop duplicate</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+<h2 class="text-lg font-semibold mt-6 mb-2">Échantillons de rejets</h2>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+{''.join(
+    f"<div class='p-3 bg-gray-50 rounded border'><h3 class='font-semibold mb-1'>{htmllib.escape(src)}</h3>"
+    + "<ul class='list-disc pl-5 text-sm'>"
+    + "".join(f"<li><b>{htmllib.escape(r)}</b> — {htmllib.escape(t)}</li>" for r,t in d['drop_samples'])
+    + "</ul></div>"
+    for src,d in DBG['sources'].items()
+)}
+</div>
+</body></html>"""
+    with open(os.path.join(OUT_DIR, "debug.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
 # ========================== Utilitaires ==========================
 
 def strip_html(text: str) -> str:
@@ -170,7 +251,6 @@ def parse_entry_datetime(entry):
         s = entry.get(attr, "")
         if s:
             try:
-                # tentative simple
                 from email.utils import parsedate_to_datetime
                 dt = parsedate_to_datetime(s)
                 if not dt.tzinfo:
@@ -209,7 +289,6 @@ def translate_offline_en_to_fr(text: str) -> str:
     if not text or not OFFLINE_TRANSLATION:
         return text
     try:
-        # Argos >= 1.9
         from argostranslate import translate as argos_translate
         argos_translate.load_installed_packages()
         out = argos_translate.translate(text, "en", "fr")
@@ -218,32 +297,40 @@ def translate_offline_en_to_fr(text: str) -> str:
         print(f"[WARN] Argos translate failed: {e}")
         return text
 
-def generate_french_summary(raw_text: str, max_chars: int = 280, *, force_en: bool = False):
+def generate_french_summary(raw_text: str, max_chars: int = 280, *, force_en: bool = False, title: str = ""):
     """
     Produit un résumé FR:
       - Si force_en=True => traduit EN→FR quoi qu'il arrive
       - Sinon: FR natif → extractif ; EN/UNK → traduction via Argos
+    Fallback : si le résumé est très court (<40) ou inchangé après trad, on tente la trad du titre.
     Retourne: (summary_fr, is_translated, detected_lang)
     """
-    if not raw_text:
+    if not raw_text and not title:
         return "", False, "unknown"
 
-    clean = strip_html(raw_text)
-    lang = detect_language_simple(clean)
+    clean = strip_html(raw_text or "")
+    lang = detect_language_simple(clean) if clean else "unknown"
 
     # Découpage en 1–2 phrases
     sentences = re.split(r"(?<=[.!?])\s+", clean)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
-    base = " ".join(sentences[:2]) if sentences else clean
+    base = " ".join(sentences[:2]) if sentences else (clean or (title or ""))
 
-    if not force_en and lang == "fr":
-        summary = base
-        translated = False
-    else:
-        summary_en = base
+    translated = False
+    summary = base
+
+    if force_en or lang != "fr":
+        summary_en = base if base else (title or "")
         summary_fr = translate_offline_en_to_fr(summary_en)
         translated = (summary_fr.strip() != summary_en.strip())
         summary = summary_fr
+
+        # Fallback si trop court ou identique
+        if len(summary.strip()) < 40 and title:
+            tfr = translate_offline_en_to_fr(title)
+            if len(tfr.strip()) > len(summary.strip()):
+                summary = tfr
+                translated = True
 
     if len(summary) > max_chars:
         summary = summary[:max_chars - 1].rsplit(" ", 1)[0] + "…"
@@ -369,17 +456,16 @@ def compute_score(title: str, summary_fr: str):
 
 def build_html(items: list[dict]):
     total = len(items)
-    high = sum(1 for x in items if x["level"] == "HIGH")
     sources_count = len({x["source"] for x in items})
-    translated_count = sum(1 for x in items if x["translated"])
-    cats = sorted({x["category"] for x in items})
+    translated_count = sum(1 for x in items if x.get("translated"))
+    cats = sorted({x["category"] for x in items}) if items else []
 
     def lv_badge(lv: str) -> str:
         return {"HIGH": "bg-red-600", "MEDIUM": "bg-orange-600", "LOW": "bg-green-600"}.get(lv, "bg-gray-500")
 
     rows = []
     for e in items:
-        tr_badge = ' <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span>' if e["translated"] else ""
+        tr_badge = ' <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span>' if e.get("translated") else ""
         rows.append(
             f"<tr class='hover:bg-gray-50' data-level='{e['level']}' data-source='{htmllib.escape(e['source'])}' data-cat='{e['category']}'>"
             f"<td class='p-3 text-sm text-gray-600'>{e['date']}</td>"
@@ -397,7 +483,6 @@ def build_html(items: list[dict]):
     generated = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     options_html = "".join(f"<option value='{c}'>{c}</option>" for c in cats)
 
-    # f-string: doubler les accolades pour CSS
     html_page = f"""<!doctype html>
 <html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -570,52 +655,67 @@ def main():
 
     for src_name, url in RSS_FEEDS.items():
         print(f"📡 {src_name}")
+        dbg_init_source(src_name)
+
         feed = parse_rss_with_headers(url)
         source_title = feed.feed.get("title", src_name)
 
-        seen = ai_pass = mil_pass = kept = 0
-
         for e in feed.entries:
-            seen += 1
+            dbg_tick(src_name, "fetched")
+
             dt = parse_entry_datetime(e)
             if not dt or dt < cutoff:
+                dbg_drop(src_name, "too_old", (e.get("title") or ""))
                 continue
+            dbg_tick(src_name, "date_ok")
 
             title = (e.get("title") or "").strip()
-            link = (e.get("link") or "").strip()
-            raw = e.get("summary") or e.get("description") or ""
+            link  = (e.get("link")  or "").strip()
+            raw   = e.get("summary") or e.get("description") or ""
             if not title or not link:
+                dbg_drop(src_name, "missing_fields", title)
                 continue
 
             text_all = f"{title}. {strip_html(raw)}"
 
             # Anti-bruit avant tout
             if matches_exclusion(text_all):
+                dbg_drop(src_name, "noise", title)
                 continue
+            dbg_tick(src_name, "not_noise")
 
             # IA obligatoire
             if not contains_any(text_all, AI_HINTS):
+                dbg_drop(src_name, "no_ai", title)
                 continue
-            ai_pass += 1
+            dbg_tick(src_name, "ai_ok")
+
             # Défense/Marine/Cyber obligatoire
             if not contains_any(text_all, DEFENSE_HINTS):
+                dbg_drop(src_name, "no_def", title)
                 continue
-            mil_pass += 1
+            dbg_tick(src_name, "def_ok")
 
             # Dédup (titre|lien)
             h = entry_hash(title, link)
             if h in seen_set:
+                dbg_drop(src_name, "duplicate", title)
                 continue
             seen_set.add(h)
+            dbg_tick(src_name, "dedup_ok")
 
             # Résumé FR (forçage EN pour certaines sources)
             force = (source_title in EN_SOURCES) or (src_name in EN_SOURCES)
-            summary_fr, translated, _ = generate_french_summary(raw, max_chars=MAX_SUMMARY_FR_CHARS, force_en=force)
+            summary_fr, translated, _ = generate_french_summary(
+                raw, max_chars=MAX_SUMMARY_FR_CHARS, force_en=force, title=title
+            )
 
             # Scoring contextuel (pertinence)
             rel = calculate_relevance_score(text_all, source_title, dt)
             if rel < RELEVANCE_MIN:
+                dbg_drop(src_name, "low_relevance", title)
                 continue
+            dbg_tick(src_name, "relevance_ok")
 
             # Catégorie & tags
             cat = classify_category(text_all)
@@ -637,13 +737,16 @@ def main():
                 category=cat,
                 tags=tags
             ))
-            kept += 1
+            dbg_tick(src_name, "kept")
 
-        print(f"[SRC] {src_name} -> vus:{seen} IA_ok:{ai_pass} DEF_ok:{mil_pass} gardés:{kept}")
+        print(f"[SRC] {src_name} -> récu:{DBG['sources'][src_name]['fetched']} "
+              f"date_ok:{DBG['sources'][src_name]['date_ok']} ia_ok:{DBG['sources'][src_name]['ai_ok']} "
+              f"def_ok:{DBG['sources'][src_name]['def_ok']} kept:{DBG['sources'][src_name]['kept']}")
 
     # Tri: pertinence desc, date desc (string YYYY-MM-DD ok), puis score hérité
     items.sort(key=lambda x: (x["rscore"], x["date"], x["score"]), reverse=True)
     build_html(items)
+    dbg_write()
 
 if __name__ == "__main__":
     main()
