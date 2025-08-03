@@ -1,18 +1,13 @@
-name: Build & Publish – Veille IA Militaire
+name: Maj veille IA Marine
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # Tous les jours à 06:00 UTC
+    - cron: "0 6 * * *"         # Tous les jours à 06:00 UTC
   workflow_dispatch:
 
+# IMPORTANT pour pouvoir pousser sur gh-pages
 permissions:
   contents: write
-  pages: write
-  id-token: write
-
-concurrency:
-  group: veille-ia-militaire
-  cancel-in-progress: true
 
 jobs:
   build:
@@ -27,51 +22,35 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install dependencies (no requirements.txt)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install feedparser "argostranslate>=1.9.0"
 
       - name: Install Argos EN→FR model
         run: |
           python - <<'PY'
-          from argostranslate import package, translate
-          package.update_package_index()
-          pkgs = package.get_available_packages()
-          en_fr = [p for p in pkgs if p.from_code == "en" and p.to_code == "fr"]
-          if en_fr:
-              path = en_fr[0].download()
-              package.install_from_path(path)
-          translate.load_installed_packages()
-          print("Argos installed:", [(l.code, [t.code for t in l.translation_languages]) for l in translate.get_installed_languages()])
+          from argostranslate import package
+          import urllib.request
+          url = "https://argosopentech.nyc3.digitaloceanspaces.com/argospm/translate-en_fr-1_9.argosmodel"
+          urllib.request.urlretrieve(url, "en_fr.argosmodel")
+          package.install_from_path("en_fr.argosmodel")
+          print("✅ Argos EN→FR installed")
           PY
 
-      - name: Build site (veille_ia.py)
+      - name: Run veille script
         env:
-          PYTHONUTF8: "1"
-          OFFLINE_TRANSLATION: "1"  # activer la traduction offline EN→FR
-          DAYS_WINDOW: "60"         # étendre la période (ajustable)
-          RELEVANCE_MIN: "0.50"     # seuil de pertinence (ajustable)
-          HALF_LIFE_DAYS: "20"      # fraîcheur (ajustable)
-          DEBUG_MODE: "1"           # mettre "0" pour désactiver debug
-        run: |
-          python veille_ia.py
+          # Active la traduction offline dans veille_ia.py
+          OFFLINE_TRANSLATION: "1"
+          # Paramètres de fenêtre et scoring contextuel (ajuste si besoin)
+          DAYS_WINDOW: "45"
+          RELEVANCE_MIN: "0.50"
+          HALF_LIFE_DAYS: "20"
+        run: python veille_ia.py
 
-      - name: Upload debug artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-report
-          path: |
-            docs/debug.html
-            docs/debug_report.json
-          if-no-files-found: ignore
-
-      - name: Publish to GitHub Pages
+      - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
           publish_branch: gh-pages
-          user_name: github-actions[bot]
-          user_email: 41898282+github-actions[bot]@users.noreply.github.com
