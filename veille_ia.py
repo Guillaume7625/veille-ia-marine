@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Veille IA – Militaire : collecte, filtrage IA+Défense, traduction FR (Argos),
-scoring contextuel, tags, génération HTML.
-Sortie : docs/index.html
+Veille IA – Militaire (Marine)
+- Collecte des flux RSS IA/Défense
+- Résumés FR (nettoyage, 2 phrases max, traduction offline EN->FR si dispo)
+- Filtre strict : IA OBLIGATOIRE + co-occurrence IA/DEF dans le titre ou une même phrase
+- Scoring (mots-clés + fraîcheur + autorité source)
+- HTML Tailwind avec filtres & export CSV (docs/index.html)
 """
-
-from __future__ import annotations
 
 import os
 import re
@@ -15,290 +16,246 @@ import html
 import time
 import logging
 import hashlib
-import unicodedata
-import calendar
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Tuple, Set
 from datetime import datetime, timezone, timedelta
 
 import requests
 import feedparser
 from dateutil import parser as date_parser
 
-# ========================= Config =========================
+# =========================== Config ===========================
 
 @dataclass
 class Config:
     days_window: int = int(os.getenv("DAYS_WINDOW", "45"))
-    relevance_min: float = float(os.getenv("RELEVANCE_MIN", "0.18"))
-    max_summary_chars: int = int(os.getenv("MAX_SUMMARY_CHARS", "320"))
+    relevance_min: float = float(os.getenv("RELEVANCE_MIN", "0.28"))
+    max_summary_chars: int = int(os.getenv("MAX_SUMMARY_CHARS", "300"))
     offline_translation: bool = os.getenv("OFFLINE_TRANSLATION", "0") == "1"
     output_dir: Path = Path("docs")
     output_file: str = "index.html"
     request_timeout: int = 25
     max_retries: int = 3
-    user_agent: str = "VeilleIA-Military/2.0 (+https://github.com/guillaume7625/veille-ia-marine)"
+    user_agent: str = "VeilleIA-Military/2.1 (+https://github.com/guillaume7625/veille-ia-marine)"
 
 config = Config()
 
-# ========================= Sources =========================
+# ======================== Sources RSS =========================
 
 RSS_SOURCES: Dict[str, Dict] = {
     "ActuIA": {
         "url": "https://www.actuia.com/feed/",
         "language": "fr",
-        "authority": 1.0,
+        "authority": 1.00,
+        "category": "tech",
     },
     "Numerama": {
         "url": "https://www.numerama.com/feed/",
         "language": "fr",
-        "authority": 0.9,
+        "authority": 0.95,
+        "category": "tech",
     },
     "VentureBeat AI": {
         "url": "https://venturebeat.com/category/ai/feed/",
         "language": "en",
-        "authority": 1.1,
+        "authority": 1.05,
+        "category": "business",
     },
     "C4ISRNet": {
         "url": "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
         "language": "en",
-        "authority": 1.2,
+        "authority": 1.15,
+        "category": "defense",
     },
     "Breaking Defense": {
         "url": "https://breakingdefense.com/feed/",
         "language": "en",
         "authority": 1.15,
+        "category": "defense",
     },
     "Naval Technology": {
         "url": "https://www.naval-technology.com/feed/",
         "language": "en",
-        "authority": 1.1,
+        "authority": 1.10,
+        "category": "naval",
     },
     "Cybersecurity Dive": {
         "url": "https://www.cybersecuritydive.com/feeds/news/",
         "language": "en",
         "authority": 1.05,
+        "category": "cyber",
     },
 }
 
-# ========================= Vocabulaire / filtres =========================
+# =================== Vocabulaire & patterns ===================
 
-# Mots-clés IA (noyau + techniques + usages)
-AI_TERMS = {
-    "intelligence artificielle", "ia", "ai", "artificial intelligence",
-    "machine learning", "apprentissage automatique", "apprentissage",
-    "deep learning", "neural network", "réseau neuronal",
-    "transformer", "inference", "inférence",
-    "llm", "large language model", "gpt", "generative", "génératif",
-    "computer vision", "vision", "nlp", "natural language processing",
-    "agent", "agents", "multi-agent", "autonomous", "autonome"
+SEMANTIC_KEYWORDS = {
+    "ai_core": {
+        "weight": 5,
+        "terms": [
+            "intelligence artificielle", "ia", "ai", "artificial intelligence",
+        ],
+    },
+    "ml_techniques": {
+        "weight": 4,
+        "terms": [
+            "machine learning", "deep learning", "neural network",
+            "apprentissage automatique", "réseau neuronal",
+            "transformer", "inference", "inférence",
+        ],
+    },
+    "ai_applications": {
+        "weight": 3,
+        "terms": [
+            "computer vision", "vision par ordinateur",
+            "nlp", "natural language processing", "traitement du langage",
+            "speech recognition", "reconnaissance vocale",
+        ],
+    },
+    "generative_ai": {
+        "weight": 4,
+        "terms": [
+            "llm", "large language model", "gpt", "generative ai", "génératif",
+            "diffusion model", "gan",
+        ],
+    },
+    "naval_platforms": {
+        "weight": 5,
+        "terms": [
+            "marine", "naval", "navy", "frégate", "fregate", "destroyer",
+            "sous-marin", "submarine", "corvette", "porte-avions",
+            "aircraft carrier", "maritime",
+        ],
+    },
+    "defense_systems": {
+        "weight": 4,
+        "terms": [
+            "radar", "sonar", "lidar", "ew", "electronic warfare", "guerre électronique",
+            "missile", "torpedo", "countermeasure", "contre-mesure",
+        ],
+    },
+    "c4isr": {
+        "weight": 5,
+        "terms": [
+            "c4isr", "c2", "command", "control", "isr",
+            "intelligence surveillance reconnaissance",
+            "situational awareness", "sensor fusion", "reconnaissance",
+        ],
+    },
+    "cyber_defense": {
+        "weight": 4,
+        "terms": [
+            "cyber", "cybersécurité", "cybersecurity", "cyber defense", "cyberdéfense",
+            "ransomware", "malware", "intrusion", "apt", "zero day", "soc",
+            "threat intelligence",
+        ],
+    },
+    "autonomous_systems": {
+        "weight": 4,
+        "terms": [
+            "drone", "uav", "uas", "usv", "uuv", "unmanned",
+            "autonomous", "autonome", "swarm", "essaim",
+        ],
+    },
 }
 
-# Mots-clés Défense/Naval/Cyber/C2/ISR/log
-DEF_TERMS = {
-    # plateformes / opérations
-    "marine", "naval", "navy", "maritime", "frégate", "destroyer",
-    "sous-marin", "submarine", "porte-avions", "aircraft carrier",
-    "drone", "uav", "uas", "uuv", "usv", "essaim", "swarm",
-    "radar", "sonar", "lidar", "missile", "torpedo",
-    "ew", "guerre électronique", "electronic warfare", "jamming",
-    "c4isr", "c2", "isr", "command", "control",
-    "warfighter", "battlefield", "tactical", "mission",
-
-    # cyber
-    "cyber", "cybersécurité", "cybersecurity", "ransomware", "intrusion", "apt",
-    "soc", "xdr", "edr", "zero-day", "threat intelligence",
-
-    # soutien/log/doctrine
-    "logistique", "maintenance", "mco", "supply chain", "soutien",
-    "training", "entraînement", "readiness", "interoperability",
-    "modernisation", "doctrine", "policy", "budget", "procurement", "acquisition", "contract",
-    "otan", "nato", "armée", "forces", "defense", "défense", "military", "pentagon"
-}
-
-# Poids simples par mots-clés pour le score "hérité"
-KEYWORDS_WEIGHTS = {
-    # IA
-    "intelligence artificielle": 4, "ia": 3, "ai": 3,
-    "machine learning": 3, "apprentissage": 2, "deep learning": 3,
-    "algorithme": 2, "transformer": 2, "llm": 3, "génératif": 2, "generative": 2,
-    "agent": 2, "multi-agent": 2, "vision": 2, "nlp": 2, "inférence": 2, "inference": 2,
-    # Défense/Marine/Cyber
-    "marine": 5, "naval": 5, "navy": 5, "navire": 3, "frégate": 4, "sous-marin": 5, "maritime": 3,
-    "armée": 3, "defense": 4, "défense": 4, "military": 4, "pentagon": 4, "otan": 4, "nato": 4,
-    "cyber": 4, "cybersécurité": 4, "cyberdéfense": 5,
-    "radar": 3, "sonar": 4, "drone": 4, "uav": 4, "uas": 4, "uuv": 4, "usv": 4,
-    "ew": 4, "guerre électronique": 5, "jamming": 3, "satellite": 3, "reconnaissance": 3,
-    "c4isr": 5, "isr": 4, "c2": 4, "command": 3,
-    "logistique": 3, "maintenance": 3, "mco": 3, "supply chain": 2,
-    "entraînement": 2, "training": 2, "interoperability": 2, "readiness": 2, "modernisation": 2,
-}
-
-# Exclusions (bruit B2C / gaming / promo…)
+# Exclusions bruit
 EXCLUSION_PATTERNS = [
-    r"\b(deal|promo|bon\s?plan|réduction|discount|sale|meilleur prix|précommander?)\b",
+    r"\b(deal|promo|bon\s?plan|reduction|discount|sale)\b",
     r"\b(gaming|jeu(x)?\s?vidéo|streaming|people|cinéma|entertainment)\b",
-    r"\b(smartphone|tablet|gadget|wearable|grand public|consumer)\b",
-    r"\b(rumeur|leak|spoiler|speculation|gossip|celebrity)\b",
+    r"\b(smartphone|tablet|gadget|consumer|grand public)\b",
+    r"\b(rumeur|rumor|leak|spoiler|speculation)\b",
 ]
 
-SOURCE_WEIGHTS = {
-    "C4ISRNet": 1.20,
-    "Breaking Defense": 1.15,
-    "Naval Technology": 1.10,
-    "VentureBeat AI": 1.05,
-    "ActuIA": 1.00,
-    "Numerama": 0.95,
-}
+# Patterns stricts IA / Défense
+AI_PATTERNS = [
+    r"\b(ai|ia)\b",
+    r"\b(machine learning|apprentissage automatique)\b",
+    r"\b(deep learning|réseau(?:x)? neuronal(?:aux)?|neural network(?:s)?)\b",
+    r"\b(llm|large language model(?:s)?)\b",
+    r"\b(génératif|generative ai|diffusion model|gan)\b",
+    r"\b(computer vision|vision par ordinateur)\b",
+    r"\b(nlp|traitement du langage|natural language processing)\b",
+    r"\b(inférence|inference)\b",
+]
+DEF_PATTERNS = [
+    r"\b(naval|marine|navy|frégate|fregate|destroyer|sous-?marin|submarine|corvette|porte-?avions|aircraft carrier|maritime)\b",
+    r"\b(c4isr|c2|isr|command|control|surveillance|reconnaissance|situational awareness|sensor fusion)\b",
+    r"\b(radar|sonar|lidar|ew|electronic warfare|guerre électronique|missile|torpedo|counter-?measure)\b",
+    r"\b(cyber|cybersécurité|cybersecurity|ransomware|malware|intrusion|apt|zero[- ]?day|soc|threat intelligence)\b",
+    r"\b(drone|uav|uas|usv|uuv|unmanned|autonom(?:e|ous)|swarm|essaim)\b",
+]
 
-# ========================= Logging =========================
+AI_PATTERNS_RE = [re.compile(p, re.IGNORECASE) for p in AI_PATTERNS]
+DEF_PATTERNS_RE = [re.compile(p, re.IGNORECASE) for p in DEF_PATTERNS]
+
+# Nettoyage trailers “The post … appeared first on …”
+POST_FOOTER_RE = re.compile(
+    r"(?:The post|Le post|L[’']?après|L’après)[^.]{0,200}"
+    r"(?:appeared first on|est apparu(?:e)? en premier sur).*$",
+    flags=re.IGNORECASE,
+)
+
+# ========================== Logging ===========================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("veille.log", encoding="utf-8")]
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
-# ========================= Utilitaires texte =========================
+# =========================== Utils ============================
 
-def normalize(text: str) -> str:
+def normalize_text(text: str) -> str:
     if not text:
         return ""
+    import unicodedata
     t = text.lower()
     t = unicodedata.normalize("NFKD", t)
     t = "".join(c for c in t if not unicodedata.combining(c))
     return t
 
-def clean_html(text: str) -> str:
+def strip_html(text: str) -> str:
     if not text:
         return ""
     t = re.sub(r"<[^>]+>", " ", text)
-    t = re.sub(r"\s+", " ", t)
-    return t.strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def clean_rss_boilerplate(text: str) -> str:
+    if not text:
+        return ""
+    t = html.unescape(text)
+    t = strip_html(t)
+    t = POST_FOOTER_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = re.split(r"(?<=[\.\!\?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
 
 def detect_language_simple(text: str) -> str:
     if not text:
         return "unknown"
     t = f" {text.lower()} "
     fr = [' le ', ' la ', ' les ', ' un ', ' une ', ' des ', ' du ', ' de ',
-          ' qui ', ' que ', ' est ', ' sont ', ' avec ', ' dans ', ' pour ', ' sur ']
+          ' qui ', ' que ', ' est ', ' sont ', ' avec ', ' dans ', ' pour ']
     en = [' the ', ' and ', ' with ', ' from ', ' that ', ' this ', ' which ',
-          ' what ', ' where ', ' when ', ' how ', ' why ', ' can ', ' will ', ' would ', ' should ']
+          ' what ', ' can ', ' will ', ' would ', ' should ', ' have ', ' has ']
     fs = sum(1 for m in fr if m in t)
     es = sum(1 for m in en if m in t)
-    if fs > es: return "fr"
-    if es > fs: return "en"
+    if fs > es:
+        return "fr"
+    if es > fs:
+        return "en"
     return "unknown"
 
-# ========================= Traduction (Argos) =========================
-
-class TranslationService:
-    def __init__(self):
-        self.available = False
-        self._translator = None
-        self._setup()
-
-    def _setup(self):
-        if not config.offline_translation:
-            logger.info("Traduction offline désactivée (OFFLINE_TRANSLATION=0)")
-            return
-        try:
-            from argostranslate import translate as argos_translate
-            langs = argos_translate.get_installed_languages()
-            en = next((l for l in langs if l.code == "en"), None)
-            fr = next((l for l in langs if l.code == "fr"), None)
-            if en and fr:
-                self._translator = en.get_translation(fr)
-                self.available = self._translator is not None
-                logger.info("✅ Argos EN→FR prêt")
-            else:
-                logger.warning("⚠️ Modèles Argos EN/FR absents (le workflow doit les installer).")
-        except Exception as e:
-            logger.warning(f"⚠️ Argos indisponible: {e}")
-
-    def translate_en_to_fr(self, text: str) -> tuple[str, bool]:
-        if not text or not self.available or self._translator is None:
-            return text, False
-        try:
-            out = self._translator.translate(text)
-            if out and out.strip() != text.strip():
-                return out, True
-            return text, False
-        except Exception as e:
-            logger.warning(f"Erreur traduction: {e}")
-            return text, False
-
-# ========================= Analyse/Scoring =========================
-
-def compute_keyword_score(text_norm: str) -> int:
-    score = 0
-    for k, w in KEYWORDS_WEIGHTS.items():
-        if normalize(k) in text_norm:
-            score += w
-    return score
-
-def classify_category(text_norm: str) -> str:
-    if any(x in text_norm for x in ["policy", "doctrine", "réglementation", "regulation", "budget", "contract", "procurement", "acquisition"]):
-        return "POLICY"
-    if any(x in text_norm for x in ["deployment", "fielded", "operational", "opérationnel", "exercise", "exercice"]):
-        return "OPERATIONAL"
-    if any(x in text_norm for x in ["threat", "menace", "ransomware", "ew", "electronic warfare", "counter-uas", "counter uas"]):
-        return "THREAT"
-    if any(x in text_norm for x in ["prototype", "test", "trial", "essai", "lab", "laboratoire", "r&d"]):
-        return "DEVELOPMENT"
-    if any(x in text_norm for x in ["alliance", "partnership", "coopération", "framework", "mou"]):
-        return "PARTNERSHIP"
-    return "TECHNOLOGY"
-
-def generate_tags(text_norm: str) -> List[str]:
-    tags = set()
-    if any(t in text_norm for t in ["llm", "gpt", "transformer", "génératif", "generative"]):
-        tags.add("LLM/Génératif")
-    if any(t in text_norm for t in ["computer vision", "vision", "image"]):
-        tags.add("Vision Artificielle")
-    if any(t in text_norm for t in ["drone", "uav", "autonomous", "autonome", "usv", "uuv"]):
-        tags.add("Systèmes Autonomes")
-    if any(t in text_norm for t in ["naval", "marine", "maritime", "submarine"]):
-        tags.add("Naval")
-    if any(t in text_norm for t in ["cyber", "ransomware", "malware", "soc"]):
-        tags.add("Cybersécurité")
-    if any(t in text_norm for t in ["c4isr", "c2", "isr", "command", "control"]):
-        tags.add("C4ISR")
-    return sorted(tags) if tags else ["—"]
-
-def relevance_score(title: str, summary: str, source: str, dt: datetime) -> float:
-    txt = normalize(f"{title} {summary}")
-    # densité simple : occurrences IA et DEF
-    ia_hits = sum(1 for t in AI_TERMS if normalize(t) in txt)
-    def_hits = sum(1 for t in DEF_TERMS if normalize(t) in txt)
-    dens = min(1.0, (0.07 * ia_hits + 0.05 * def_hits))
-    # co-occurrence
-    co = 1.3 if (ia_hits > 0 and def_hits > 0) else 1.0
-    # autorité
-    srcw = SOURCE_WEIGHTS.get(source, 1.0)
-    # fraicheur (demi-vie 3 jours)
-    age_h = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
-    fresh = max(0.5, 2 ** (-age_h / 72.0))
-    score = dens * co * srcw * fresh
-    return float(round(min(1.5, max(0.0, score)), 6))
-
-def is_excluded(text_norm: str) -> bool:
-    for pat in EXCLUSION_PATTERNS:
-        if re.search(pat, text_norm):
-            # Laisse passer si contexte défense fort
-            if any(t in text_norm for t in DEF_TERMS):
-                continue
-            return True
-    return False
-
-def has_ai_and_defense(text_norm: str) -> bool:
-    ai_ok = any(t in text_norm for t in (normalize(x) for x in AI_TERMS))
-    def_ok = any(t in text_norm for t in (normalize(x) for x in DEF_TERMS))
-    return ai_ok and def_ok
-
-# ========================= Modèle d'article =========================
+# ======================= Modèle d'article =====================
 
 @dataclass
 class Article:
@@ -308,18 +265,253 @@ class Article:
     source: str
     date: datetime
     language: str
-    translated: bool
-    keyword_score: int
-    priority_level: str
-    category: str
-    relevance_score: float
-    tags: List[str]
+    translated: bool = False
+    relevance_score: float = 0.0
+    keyword_score: int = 0
+    priority_level: str = "LOW"
+    category: str = "TECHNOLOGY"
+    tags: List[str] = None
+
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
 
     @property
     def hash_id(self) -> str:
-        return hashlib.md5(f"{self.title}|{self.link}".encode()).hexdigest()
+        return hashlib.md5(f"{self.title}|{self.link}".encode("utf-8")).hexdigest()
 
-# ========================= Collecteur RSS =========================
+# ===================== Traduction offline =====================
+
+class TranslationService:
+    def __init__(self):
+        self.available = False
+        self.translation = None
+        self._setup()
+
+    def _setup(self):
+        if not config.offline_translation:
+            logger.info("Traduction offline désactivée (OFFLINE_TRANSLATION=0).")
+            return
+        try:
+            from argostranslate import translate as argos_translate
+            langs = argos_translate.get_installed_languages()
+            en = next((l for l in langs if l.code == "en"), None)
+            fr = next((l for l in langs if l.code == "fr"), None)
+            if en and fr:
+                self.translation = en.get_translation(fr)
+                self.available = self.translation is not None
+                if self.available:
+                    logger.info("✅ Argos EN→FR prêt.")
+                else:
+                    logger.warning("⚠️ Argos EN→FR non initialisé.")
+            else:
+                logger.warning("⚠️ Modèles Argos EN/FR absents (le workflow peut les installer).")
+        except Exception as e:
+            logger.warning(f"⚠️ Argos indisponible: {e}")
+
+    def translate_en_to_fr(self, text: str) -> Tuple[str, bool]:
+        if not text or not self.available or self.translation is None:
+            return text, False
+        try:
+            out = self.translation.translate(text)
+            if out and out.strip() and out.strip() != text.strip():
+                return out, True
+            return text, False
+        except Exception as e:
+            logger.warning(f"Erreur traduction: {e}")
+            return text, False
+
+# ====================== Analyse de contenu =====================
+
+class ContentAnalyzer:
+    def __init__(self):
+        self.translator = TranslationService()
+
+    # --- Détection IA / Défense ---
+    def _has_ai(self, text: str) -> bool:
+        t = text or ""
+        return any(p.search(t) for p in AI_PATTERNS_RE)
+
+    def _has_defense(self, text: str) -> bool:
+        t = text or ""
+        return any(p.search(t) for p in DEF_PATTERNS_RE)
+
+    def _cooccurs_ai_def_in_title_or_sentence(self, title: str, summary: str) -> bool:
+        scopes = [title] + split_sentences(summary)
+        for scope in scopes:
+            s = scope.lower()
+            if self._has_ai(s) and self._has_defense(s):
+                return True
+        return False
+
+    # --- Exclusions bruit (avec exception si contexte défense fort) ---
+    def is_excluded(self, text_norm: str) -> bool:
+        for pattern in EXCLUSION_PATTERNS:
+            if re.search(pattern, text_norm):
+                defense_ctx_terms = (
+                    SEMANTIC_KEYWORDS["naval_platforms"]["terms"] +
+                    SEMANTIC_KEYWORDS["defense_systems"]["terms"] +
+                    SEMANTIC_KEYWORDS["c4isr"]["terms"]
+                )
+                if not any(normalize_text(t) in text_norm for t in defense_ctx_terms):
+                    return True
+        return False
+
+    # --- Scores & classements ---
+    def _keyword_score(self, text: str) -> int:
+        t = normalize_text(text)
+        score = 0
+        for _, data in SEMANTIC_KEYWORDS.items():
+            w = data["weight"]
+            for term in data["terms"]:
+                if normalize_text(term) in t:
+                    score += w
+        return score
+
+    def _relevance_score(self, article: Article, authority: float) -> float:
+        t = normalize_text(f"{article.title} {article.summary}")
+        sem = 0.0
+        for _, data in SEMANTIC_KEYWORDS.items():
+            w = data["weight"]
+            for term in data["terms"]:
+                if normalize_text(term) in t:
+                    sem += 0.1 * w
+        # fraîcheur (demi-vie ~3 jours)
+        age_h = max(0.0, (datetime.now(timezone.utc) - article.date).total_seconds() / 3600.0)
+        freshness = max(0.5, 2 ** (-age_h / 72.0))
+        # bonus co-occurrence
+        co = 1.3 if (self._has_ai(t) and self._has_defense(t)) else 1.0
+        score = (sem * authority * freshness * co) / 10.0
+        return max(0.0, min(1.5, score))
+
+    def classify_category(self, text: str) -> str:
+        t = text.lower()
+        if re.search(r"\b(policy|réglementation|regulation|budget|appropriation|spending|bill|award|contract|option year|procurement|acquisition)\b", t):
+            return "POLICY"
+        if re.search(r"\b(prototype|trial|essai|r&d|laboratoire|lab|research|paper)\b", t):
+            return "DEVELOPMENT"
+        if re.search(r"\b(deployment|deployed|fielded|opérationnel|operational|exercise|exercice)\b", t):
+            return "OPERATIONAL"
+        if re.search(r"\b(threat|menace|intrusion|ransomware|ew|electronic warfare|counter-uas|counter uas)\b", t):
+            return "THREAT"
+        if re.search(r"\b(partnership|alliance|accord|coopération|framework|mou|moa)\b", t):
+            return "PARTNERSHIP"
+        return "TECHNOLOGY"
+
+    def generate_tags(self, article: Article) -> List[str]:
+        t = f"{article.title} {article.summary}".lower()
+        tags = set()
+        if re.search(r"\b(llm|large language model|génératif|generative ai|diffusion model|gan)\b", t):
+            tags.add("LLM/Génératif")
+        if re.search(r"\b(computer vision|vision par ordinateur)\b", t):
+            tags.add("Vision Artificielle")
+        if re.search(r"\b(nlp|traitement du langage|natural language processing)\b", t):
+            tags.add("NLP")
+
+        if re.search(r"\b(naval|marine|navy|sous-?marin|submarine|destroyer|frégate|fregate|maritime)\b", t):
+            tags.add("Naval")
+        if re.search(r"\b(c4isr|c2|isr|command|control|surveillance|reconnaissance)\b", t):
+            tags.add("C4ISR")
+        if re.search(r"\b(cyber|cybersécurité|cybersecurity|ransomware|malware|intrusion)\b", t):
+            tags.add("Cybersécurité")
+        if re.search(r"\b(drone|uav|uas|usv|uuv|unmanned|autonom(?:e|ous)|swarm|essaim)\b", t):
+            tags.add("Systèmes Autonomes")
+
+        if re.search(r"\b(prototype|research|laboratoire|laboratory|paper)\b", t):
+            tags.add("R&D")
+        if re.search(r"\b(deployment|deployed|fielded|operational|opérationnel|exercise|exercice)\b", t):
+            tags.add("Opérationnel")
+
+        return sorted(tags) if tags else ["—"]
+
+    # --- Parsing date ---
+    def _parse_date(self, entry) -> Optional[datetime]:
+        for fld in ("published_parsed", "updated_parsed"):
+            if hasattr(entry, fld) and getattr(entry, fld):
+                import calendar
+                try:
+                    ts = calendar.timegm(getattr(entry, fld))
+                    return datetime.fromtimestamp(ts, tz=timezone.utc)
+                except Exception:
+                    pass
+        for fld in ("published", "updated", "pubDate"):
+            s = entry.get(fld, "")
+            if s:
+                try:
+                    return date_parser.parse(s).astimezone(timezone.utc)
+                except Exception:
+                    pass
+        return None
+
+    # --- Pipeline article ---
+    def process_entry(self, entry, src_name: str, meta: Dict) -> Optional[Article]:
+        title = (entry.get("title") or "").strip()
+        link = (entry.get("link") or "").strip()
+        raw = entry.get("summary") or entry.get("description") or ""
+        if not title or not link:
+            return None
+
+        # Nettoyage + 2 phrases max
+        clean = clean_rss_boilerplate(raw)
+        sentences = split_sentences(clean)
+        base = " ".join(sentences[:2]) if sentences else clean
+
+        # Détection & traduction
+        detected = detect_language_simple(f"{title} {base}")
+        src_lang = meta.get("language", "unknown")
+        summary = base
+        translated = False
+        if (src_lang == "en") or (detected == "en"):
+            summary, translated = self.translator.translate_en_to_fr(summary)
+
+        # Limitation longueur
+        if len(summary) > config.max_summary_chars:
+            summary = summary[:config.max_summary_chars - 1].rsplit(" ", 1)[0] + "…"
+
+        # Date
+        dt = self._parse_date(entry) or datetime.now(timezone.utc)
+
+        # Filtres
+        title_l = title.lower()
+        summary_l = summary.lower()
+        norm_all = normalize_text(f"{title} {summary}")
+
+        if self.is_excluded(norm_all):
+            return None
+        # IA obligatoire + co-occurrence IA/DEF locale (titre ou même phrase)
+        if not self._has_ai(norm_all):
+            return None
+        if not self._cooccurs_ai_def_in_title_or_sentence(title_l, summary_l):
+            return None
+
+        # Construction article
+        article = Article(
+            title=title,
+            link=link,
+            summary=summary,
+            source=src_name,
+            date=dt,
+            language=detected,
+            translated=translated,
+        )
+
+        # Scores
+        article.keyword_score = self._keyword_score(f"{title} {summary}")
+        article.relevance_score = self._relevance_score(article, meta.get("authority", 1.0))
+        article.category = self.classify_category(f"{title} {summary}")
+        article.tags = self.generate_tags(article)
+
+        # Priorité
+        if article.keyword_score >= 15:
+            article.priority_level = "HIGH"
+        elif article.keyword_score >= 8:
+            article.priority_level = "MEDIUM"
+        else:
+            article.priority_level = "LOW"
+
+        return article
+
+# ===================== Collecteur RSS réseau ====================
 
 class RSSCollector:
     def __init__(self):
@@ -332,17 +524,17 @@ class RSSCollector:
                 r = self.session.get(url, timeout=config.request_timeout)
                 r.raise_for_status()
                 feed = feedparser.parse(r.content)
-                if getattr(feed, "bozo", False) and getattr(feed, "bozo_exception", None):
-                    logger.warning(f"Feed partiellement malformé ({url}): {feed.bozo_exception}")
+                if feed.bozo and getattr(feed, "bozo_exception", None):
+                    logging.warning(f"Feed partiellement malformé: {feed.bozo_exception}")
                 return feed
             except requests.RequestException as e:
-                logger.warning(f"[{attempt+1}/{config.max_retries}] Erreur réseau {url}: {e}")
+                logging.warning(f"[{attempt+1}/{config.max_retries}] Erreur réseau {url}: {e}")
                 if attempt < config.max_retries - 1:
                     time.sleep(2 ** attempt)
-        logger.error(f"Échec définitif {url}")
+        logging.error(f"Échec définitif {url}")
         return feedparser.FeedParserDict(feed={}, entries=[])
 
-# ========================= Générateur HTML =========================
+# ======================= Générateur HTML =======================
 
 class HTMLGenerator:
     def __init__(self, articles: List[Article]):
@@ -538,6 +730,16 @@ class HTMLGenerator:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Veille IA – Militaire</title>
   <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <style>
+    .summary-cell {{
+      max-height: 4.5rem;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      line-height: 1.5;
+    }}
+  </style>
 </head>
 <body class="bg-gray-50">
   {self._header(self._stats())}
@@ -548,37 +750,18 @@ class HTMLGenerator:
 </html>
 """
 
-# ========================= Orchestration =========================
-
-def parse_entry_datetime(entry) -> Optional[datetime]:
-    for fld in ("published_parsed", "updated_parsed"):
-        t = getattr(entry, fld, None)
-        if t:
-            try:
-                ts = calendar.timegm(t)
-                return datetime.fromtimestamp(ts, tz=timezone.utc)
-            except Exception:
-                pass
-    for fld in ("published", "updated", "pubDate"):
-        s = entry.get(fld, "")
-        if s:
-            try:
-                return date_parser.parse(s).astimezone(timezone.utc)
-            except Exception:
-                pass
-    return None
+# =========================== Main ==============================
 
 def main():
     logger.info(f"CFG days_window={config.days_window} relevance_min={config.relevance_min} offline_translation={config.offline_translation}")
-
     collector = RSSCollector()
-    translator = TranslationService()
+    analyzer = ContentAnalyzer()
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.days_window)
     seen: Set[str] = set()
     kept: List[Article] = []
-    total_seen = 0
 
+    total_seen = 0
     for src_name, meta in RSS_SOURCES.items():
         url = meta["url"]
         feed = collector.fetch(url)
@@ -586,74 +769,20 @@ def main():
         logger.info(f"Source {src_name}: {len(entries)} entrées")
         total_seen += len(entries)
 
-        for e in entries:
-            # Date
-            dt = parse_entry_datetime(e) or datetime.now(timezone.utc)
-            if dt < cutoff:
+        for entry in entries:
+            art = analyzer.process_entry(entry, src_name, meta)
+            if not art:
                 continue
-
-            # Titre / lien / contenu
-            title = (e.get("title") or "").strip()
-            link = (e.get("link") or "").strip()
-            raw = e.get("summary") or e.get("description") or ""
-            if not title or not link:
+            if art.date < cutoff:
                 continue
-
-            # Nettoyage + langue
-            clean = clean_html(raw)
-            detected_lang = detect_language_simple(f"{title} {clean}")
-
-            # Traduction si la source est EN ou si détection EN
-            summary = clean
-            translated = False
-            if config.offline_translation and (meta.get("language") == "en" or detected_lang == "en"):
-                summary, translated = translator.translate_en_to_fr(clean)
-
-            # Coupe les résumés trop longs (après trad)
-            if len(summary) > config.max_summary_chars:
-                summary = summary[:config.max_summary_chars - 1].rsplit(" ", 1)[0] + "…"
-
-            # Texte pour filtres
-            text_norm = normalize(f"{title} {summary}")
-
-            # Exclusion "bruit"
-            if is_excluded(text_norm):
+            if art.relevance_score < config.relevance_min:
                 continue
-
-            # Règle de base : IA + Défense obligatoires
-            if not has_ai_and_defense(text_norm):
-                continue
-
-            # Scoring & garde-fous
-            kw_score = compute_keyword_score(text_norm)
-            cat = classify_category(text_norm)
-            rscore = relevance_score(title, summary, src_name, dt)
-            if rscore < config.relevance_min:
-                continue
-            tags = generate_tags(text_norm)
-
-            art = Article(
-                title=title,
-                link=link,
-                summary=summary,
-                source=src_name,
-                date=dt,
-                language=detected_lang,
-                translated=translated,
-                keyword_score=kw_score,
-                priority_level=("HIGH" if kw_score >= 15 else "MEDIUM" if kw_score >= 8 else "LOW"),
-                category=cat,
-                relevance_score=rscore,
-                tags=tags
-            )
-
-            # dédup (titre|lien)
             if art.hash_id in seen:
                 continue
             seen.add(art.hash_id)
             kept.append(art)
 
-    # Tri : pertinence desc, date desc, score desc
+    # Tri : pertinence desc, date desc, keyword_score desc
     kept.sort(key=lambda a: (a.relevance_score, a.date, a.keyword_score), reverse=True)
 
     # Génération HTML
