@@ -3,23 +3,22 @@ name: Maj veille IA Marine
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 6 * * *'   # tous les jours à 06:30 UTC
+    - cron: '30 6 * * *'     # tous les jours à 06:30 UTC
   push:
     branches: [ main ]
 
 permissions:
-  contents: write   # pour pousser sur gh-pages
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     env:
-      # --- Paramètres de ta veille ---
-      DAYS_WINDOW: '45'               # fenêtre glissante (jours)
-      RELEVANCE_MIN: '0.50'           # seuil de pertinence contextuelle
-      MAX_SUMMARY_FR_CHARS: '280'     # longueur max des résumés FR
-      OFFLINE_TRANSLATION: '1'        # activer la traduction Argos offline
+      DAYS_WINDOW: '45'
+      RELEVANCE_MIN: '0.50'
+      MAX_SUMMARY_FR_CHARS: '280'
+      OFFLINE_TRANSLATION: '1'
 
     steps:
       - name: Checkout
@@ -30,31 +29,42 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install requirements
+      # Debug: afficher le contenu réel du requirements
+      - name: Show requirements (debug)
+        run: |
+          echo "=== .github/workflows/requirements.txt ==="
+          if [ -f .github/workflows/requirements.txt ]; then
+            sed -n '1,120p' .github/workflows/requirements.txt
+          else
+            echo "(absent)"
+          fi
+          echo "========================================="
+
+      # Installation robuste (sans dépendre du fichier)
+      - name: Install requirements (robust)
         run: |
           python -m pip install --upgrade pip
-          pip install -r .github/workflows/requirements.txt
+          # Installe explicitement les libs requises :
+          pip install 'feedparser==6.0.11' 'argostranslate==1.9.0'
 
-      # Cache des modèles Argos (plus rapide et moins de bande passante)
+      # Cache des modèles Argos
       - name: Cache Argos models
         uses: actions/cache@v4
         with:
           path: |
             ~/.local/share/argos-translate
-          key: ${{ runner.os }}-argos-${{ hashFiles('.github/workflows/requirements.txt') }}
+          key: ${{ runner.os }}-argos-cache-v1
 
-      # >>> NOUVELLE ÉTAPE : installation via le catalogue officiel Argos
+      # Installation Argos EN->FR via le catalogue officiel
       - name: Install Argos EN→FR model
         run: |
           python - <<'PY'
           from argostranslate import package, translate
-          # Récupère les paquets disponibles (catalogue officiel)
-          available_packages = package.get_available_packages()
-          # Cherche EN->FR
-          en_fr = next(p for p in available_packages if p.from_code == "en" and p.to_code == "fr")
+          available = package.get_available_packages()
+          en_fr = next(p for p in available if p.from_code == "en" and p.to_code == "fr")
           print(f"⇣ Téléchargement modèle EN→FR {en_fr.package_version}…")
-          pkg_path = en_fr.download()
-          package.install_from_path(pkg_path)
+          path = en_fr.download()
+          package.install_from_path(path)
           translate.load_installed_packages()
           print("✅ Modèle Argos EN→FR installé")
           PY
