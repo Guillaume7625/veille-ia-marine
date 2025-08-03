@@ -1,2 +1,2 @@
-feedparser==6.0.11
-argostranslate==1.9.0
+feedparser>=6.0.10
+argostranslate>=1.9.0
