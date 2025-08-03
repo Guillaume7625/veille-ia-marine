@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Veille IA – Militaire (Marine) – full web, scoring contextuel + DEBUG
+Veille IA – Militaire (Marine) – full web + résumés FR offline (Argos)
 - Fenêtre glissante configurable (DAYS_WINDOW)
-- Filtrage strict: IA OBLIGATOIRE + Défense/Marine/Cyber OBLIGATOIRE
-- Déduplication (titre|lien)
-- (Optionnel) Traduction offline EN→FR via Argos (désactivée pour debug)
-- Scoring contextuel (densité, co-occurrence IA+DEF, autorité source, fraîcheur)
-- Catégorisation + tags
-- UI Tailwind + filtres (niveau, source, catégorie) + export CSV
-- Sortie: docs/index.html (pour GitHub Pages)
-Dépendances : feedparser, (argostranslate si OFFLINE_TRANSLATION=1)
+- IA OBLIGATOIRE + Défense/Marine/Cyber OBLIGATOIRE (plus robuste)
+- Traduction offline EN→FR via Argos si OFFLINE_TRANSLATION=1
+- Scoring contextuel + pertinence (seuil RELEVANCE_MIN)
+- UI Tailwind, export CSV
 """
 
 import os
@@ -26,84 +22,82 @@ import feedparser
 
 # ========================== Configuration ==========================
 
-# Fenêtre glissante (jours) — élargie pour debug
-DAYS_WINDOW = int(os.getenv("DAYS_WINDOW", "60"))
-
-# Sortie GitHub Pages
+DAYS_WINDOW = int(os.getenv("DAYS_WINDOW", "30"))
 OUT_DIR = "docs"
 OUT_FILE = "index.html"
-
-# Longueur max des résumés FR
 MAX_SUMMARY_FR_CHARS = int(os.getenv("MAX_SUMMARY_FR_CHARS", "280"))
-
-# Traduction offline via Argos (désactivée pour debug)
 OFFLINE_TRANSLATION = os.getenv("OFFLINE_TRANSLATION", "0") in {"1", "true", "True"}
-
-# Seuil de pertinence contextuelle (0–1.5 borné) — assoupli pour debug
-RELEVANCE_MIN = float(os.getenv("RELEVANCE_MIN", "0.1"))
-
-# Demi-vie (jours) pour la fraîcheur
+RELEVANCE_MIN = float(os.getenv("RELEVANCE_MIN", "0.55"))
 HALF_LIFE_DAYS = int(os.getenv("HALF_LIFE_DAYS", "15"))
-
-# User-Agent explicite
 UA = "VeilleIA/1.0 (+https://github.com/guillaume7625/veille-ia-marine)"
 
-# Feeds (nom -> URL)
 RSS_FEEDS = {
-    # IA FR
     "ActuIA": "https://www.actuia.com/feed/",
     "Numerama": "https://www.numerama.com/feed/",
-    # IA EN
     "AI News | VentureBeat": "https://venturebeat.com/category/ai/feed/",
-    # Défense / Naval / Cyber
     "C4ISRNet": "https://www.c4isrnet.com/arc/outboundfeeds/rss/",
     "Breaking Defense": "https://breakingdefense.com/feed/",
     "Naval Technology": "https://www.naval-technology.com/feed/",
     "Cybersecurity Dive - Latest News": "https://www.cybersecuritydive.com/feeds/news/",
 }
 
-# Sources considérées EN (pour forcer traduction si besoin plus tard)
+# Sources explicitement "défense"
+DEFENSE_SOURCES = {
+    "C4ISRNet", "Breaking Defense", "Defense News", "Defense One",
+    "Jane's Defence", "Naval Technology", "Naval News",
+}
+
+# Forçage traduction EN pour ces sources
 EN_SOURCES = {
     "AI News | VentureBeat", "VentureBeat AI", "VentureBeat",
     "Breaking Defense", "Defense News", "Defense One",
     "C4ISRNet", "Naval Technology", "Cybersecurity Dive - Latest News",
 }
 
-# Pondération (score hérité)
+# Pondérations basiques pour l'ancien score (affiché dans la colonne Score)
 KEYWORDS_WEIGHTS = {
     # IA
-    "intelligence artificielle": 4, "ia": 3, "ai": 3,
+    "artificial intelligence": 4, "intelligence artificielle": 4, "ia": 3, "ai": 3,
     "machine learning": 3, "apprentissage": 2, "deep learning": 3,
     "algorithme": 2, "transformer": 2, "llm": 3, "génératif": 2, "generative": 2,
     "agent": 2, "multi-agent": 2, "vision": 2, "nlp": 2, "inférence": 2, "inference": 2,
     # Défense/Marine/Cyber
     "marine": 5, "naval": 5, "navy": 5, "navire": 3, "frégate": 4, "sous-marin": 5, "maritime": 3,
-    "armée": 3, "defense": 4, "défense": 4, "otan": 4, "nato": 4, "doctrine": 3,
+    "armée": 3, "defense": 4, "defence": 4, "défense": 4, "pentagon": 4, "dod": 4,
+    "otan": 4, "nato": 4, "air force": 4, "space force": 4, "usaf": 4, "usn": 4, "usmc": 4, "raf": 4,
     "cyber": 4, "cybersécurité": 4, "cyberdéfense": 5,
     "radar": 3, "sonar": 4, "drone": 4, "uav": 4, "aéronaval": 5,
-    "brouillage": 4, "guerre électronique": 5, "satellite": 3, "reconnaissance": 3,
-    "c4isr": 5, "isr": 4, "c2": 4, "command": 3,
-    # Soutien/log
+    "brouillage": 4, "guerre électronique": 5, "electronic warfare": 5,
+    "satellite": 3, "reconnaissance": 3, "isr": 4, "c4isr": 5, "c2": 4, "command": 3,
     "logistique": 3, "maintenance": 3, "mco": 3, "supply chain": 2,
     "entraînement": 2, "training": 2, "interoperability": 2, "readiness": 2, "modernisation": 2,
 }
 
-# Hints IA + Défense (obligatoires)
+# IA obligatoire : on élargit
 AI_HINTS = {
-    "ia", "intelligence artificielle", "ai", "machine learning", "apprentissage",
-    "deep learning", "algorithme", "transformer", "llm", "génératif", "generative",
-    "agent", "multi-agent", "nlp", "vision", "inférence", "inference",
+    "ia", "intelligence artificielle", "artificial intelligence",
+    "ai", "ai/ml", "machine learning", "machine-learning", "apprentissage",
+    "deep learning", "deep-learning", "algorithme", "transformer", "llm",
+    "génératif", "generative", "agent", "multi-agent", "autonomous", "autonomy",
+    "nlp", "vision", "inférence", "inference",
 }
+
+# Défense obligatoire : on inclut davantage d’anglais
 DEFENSE_HINTS = {
+    # français
     "marine", "naval", "navy", "frégate", "sous-marin", "sonar", "radar",
     "drone", "uav", "missile", "aéronaval", "c4isr", "isr", "ew", "guerre électronique",
     "otan", "nato", "armée", "forces", "c2", "command",
     "logistique", "maintenance", "mco", "supply chain", "entraînement", "training",
     "interoperability", "readiness", "modernisation",
     "cyber", "cybersécurité", "cyberdéfense", "ransomware", "intrusion",
+    # anglais générique défense
+    "defense", "defence", "military", "warfighter", "warfare", "pentagon", "dod",
+    "air force", "space force", "army", "marine corps", "marines", "usaf", "usn", "usmc",
+    "royal navy", "raf", "naval forces", "fleet", "task force",
 }
 
-# Anti-bruit (regex)
+# Anti-bruit
 EXCLUSION_PATTERNS = [
     r"\b(deal|promo|bon\s?plan|meilleur prix|précommander?)\b",
     r"\b(gaming|jeu(x)? vidéo|streaming|people|cinéma)\b",
@@ -111,11 +105,10 @@ EXCLUSION_PATTERNS = [
     r"\b(smartphone|gadget|wearable)\b",
 ]
 
-# Pondération source (autorité)
 SOURCE_WEIGHTS = {
-    "C4ISRNet": 1.15,
-    "Breaking Defense": 1.15,
-    "Naval Technology": 1.10,
+    "C4ISRNet": 1.18,
+    "Breaking Defense": 1.18,
+    "Naval Technology": 1.12,
     "AI News | VentureBeat": 1.05,
     "VentureBeat AI": 1.05,
     "Numerama": 1.00,
@@ -184,8 +177,8 @@ def detect_language_simple(text: str) -> str:
     if not text:
         return "unknown"
     t = " " + text.lower() + " "
-    fr = [' le ', ' la ', ' les ', ' un ', ' une ', ' des ', ' du ', ' de ', ' qui ', ' que ', ' où ', ' est ', ' sont ', ' avec ', ' dans ', ' pour ', ' sur ']
-    en = [' the ', ' and ', ' with ', ' from ', ' that ', ' this ', ' which ', ' what ', ' where ', ' when ', ' how ', ' why ', ' can ', ' will ', ' would ', ' should ']
+    fr = [' le ', ' la ', ' les ', ' un ', ' une ', ' des ', ' du ', ' de ', ' qui ', ' que ', ' où ', ' est ', ' sont ']
+    en = [' the ', ' and ', ' with ', ' from ', ' that ', ' this ', ' which ', ' what ', ' where ', ' when ', ' how ']
     f = sum(1 for m in fr if m in t)
     e = sum(1 for m in en if m in t)
     if f > e: return "fr"
@@ -193,25 +186,19 @@ def detect_language_simple(text: str) -> str:
     return "unknown"
 
 def translate_offline_en_to_fr(text: str) -> str:
-    """Désactivé pour debug (retourne le texte original)."""
     if not text or not OFFLINE_TRANSLATION:
         return text
     try:
         from argostranslate import translate as argos_translate
-        # NOTE: pas de téléchargement dans le pipeline pour le debug
-        langs = argos_translate.load_installed_languages()
-        fr = next((l for l in langs if l.code == "fr"), None)
-        en = next((l for l in langs if l.code == "en"), None)
-        if not fr or not en:
-            return text
-        pair = en.get_translation(fr)
-        return pair.translate(text) or text
+        # (1.9) charge les langues installées
+        argos_translate.load_installed_languages()
+        out = argos_translate.translate(text, "en", "fr")
+        return out if out else text
     except Exception as e:
         print(f"[WARN] Argos translate failed: {e}")
         return text
 
 def generate_french_summary(raw_text: str, max_chars: int = 280, *, force_en: bool = False):
-    """FR: extrait 1–2 phrases; si EN (ou force_en) → traduction (désactivée en debug)."""
     if not raw_text:
         return "", False, "unknown"
     clean = strip_html(raw_text)
@@ -231,7 +218,7 @@ def generate_french_summary(raw_text: str, max_chars: int = 280, *, force_en: bo
         summary = summary[:max_chars - 1].rsplit(" ", 1)[0] + "…"
     return summary, translated, lang
 
-# ====================== Scoring contextuel ======================
+# ====================== Scoring / Pertinence ======================
 
 def split_sentences(txt: str) -> list[str]:
     if not txt: return []
@@ -239,14 +226,14 @@ def split_sentences(txt: str) -> list[str]:
     return [p.strip() for p in parts if len(p.strip()) > 0]
 
 IA_CONTEXT = {
-    "core": {"ia","intelligence artificielle","ai","machine learning","apprentissage","deep learning"},
+    "core": {"ia","intelligence artificielle","artificial intelligence","ai","machine learning","apprentissage","deep learning"},
     "applications": {"computer vision","nlp","reconnaissance","prédiction","anomaly"},
     "techniques": {"transformer","neuronal","neural","algorithme","fine-tuning","inférence","inference"},
-    "emerging": {"llm","génératif","generative","multimodal","agent","multi-agent","edge computing"},
+    "emerging": {"llm","génératif","generative","multimodal","agent","multi-agent","edge computing","autonomous","autonomy"},
 }
 DEF_CONTEXT = {
-    "operations": {"c4isr","isr","warfare","mission","tactical","command","c2","joint"},
-    "plateformes": {"naval","marine","navy","uav","drone","frégate","sous-marin","sonar","radar","missile","aéronaval"},
+    "operations": {"c4isr","isr","warfare","mission","tactical","command","c2","joint","pentagon","dod"},
+    "plateformes": {"naval","marine","navy","uav","drone","frégate","sous-marin","sonar","radar","missile","aéronaval","air force","space force","army","usaf","usn","usmc"},
     "support": {"logistique","maintenance","mco","supply chain","training","entraînement","interoperability","readiness","modernisation"},
     "cyber": {"cyber","cybersécurité","ransomware","intrusion","zero-day","xdr","edr","soc","threat intelligence"},
 }
@@ -274,7 +261,11 @@ def co_occurrence_bonus(text: str) -> float:
     return min(bonus, 1.4)
 
 def source_authority(src: str) -> float:
-    return SOURCE_WEIGHTS.get(src, 1.0)
+    w = SOURCE_WEIGHTS.get(src, 1.0)
+    # petit coup de pouce si source défense
+    if src in DEFENSE_SOURCES:
+        w *= 1.08
+    return w
 
 def temporal_relevance(dt: datetime) -> float:
     if not isinstance(dt, datetime): return 0.9
@@ -299,6 +290,8 @@ def calculate_relevance_score(text: str, src: str, dt: datetime) -> float:
     fresh = temporal_relevance(dt)
     score = dens * bonus * srcw * fresh
     return max(0.0, min(1.5, score))
+
+# ========================== Catégorisation ==========================
 
 def classify_category(text: str) -> str:
     t = normalize(text)
@@ -330,16 +323,35 @@ def generate_smart_tags(text: str) -> str:
     if any(k in t for k in IA_CONTEXT["techniques"]): tags.add("Techniques")
     return ", ".join(sorted(tags)) or "—"
 
-# ===================== Score/Level (hérité) =====================
+# ===================== Score/Level (héritage) =====================
 
 def compute_score(title: str, summary_fr: str):
     txt = normalize(f"{title or ''} {summary_fr or ''}")
     score = 0
     for k, w in KEYWORDS_WEIGHTS.items():
-        if k in txt:
-            score += w
+        if k in txt: score += w
     level = "HIGH" if score >= 9 else "MEDIUM" if score >= 5 else "LOW"
     return score, level
+
+# ===================== Logique Défense Contextuelle =====================
+
+_LOOSE_DEF_PAT = re.compile(
+    r"\b(defen[cs]e|military|warfighter|warfare|pentagon|u\.?s\.?\s?(navy|army|air\s?force|space\s?force)|"
+    r"usaf|usn|usmc|raf|royal\s?navy|dod)\b"
+)
+
+def is_defense_context(text_all: str, source_title: str) -> bool:
+    """Retourne True si le contexte 'défense' est probable même sans mot-clé strict."""
+    t = normalize(text_all)
+    if contains_any(text_all, DEFENSE_HINTS):
+        return True
+    # Si source pure défense et on parle d'IA → OK
+    if source_title in DEFENSE_SOURCES and contains_any(text_all, AI_HINTS):
+        return True
+    # Patrons anglais fréquents
+    if _LOOSE_DEF_PAT.search(t):
+        return True
+    return False
 
 # ============================ HTML ============================
 
@@ -408,7 +420,7 @@ def build_html(items: list[dict]):
       <div class="text-gray-600">Articles</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-red-600">{high}</div>
+      <div class="text-3xl font-bold text-red-600">{sum(1 for x in items if x["level"] == "HIGH")}</div>
       <div class="text-gray-600">Priorité Haute</div>
     </div>
     <div class="bg-white rounded shadow p-4 text-center">
@@ -544,30 +556,26 @@ def main():
     items = []
     seen_set = set()
 
+    total_seen = 0
+    total_kept = 0
+
     for src_name, url in RSS_FEEDS.items():
         print(f"📡 {src_name} -> {url}")
         feed = parse_rss_with_headers(url)
         source_title = feed.feed.get("title", src_name)
 
-        seen = 0
-        ai_pass = 0
-        mil_pass = 0
-        kept = 0
+        seen = ai_ok = def_ok = kept = 0
 
         for e in feed.entries:
-            seen += 1
+            seen += 1; total_seen += 1
             dt = parse_entry_datetime(e)
-            if not dt:
-                print(f"[DEBUG] {src_name}: entrée sans date → skip")
-                continue
-            if dt < cutoff:
+            if not dt or dt < cutoff:
                 continue
 
             title = (e.get("title") or "").strip()
             link = (e.get("link") or "").strip()
             raw = e.get("summary") or e.get("description") or ""
             if not title or not link:
-                print(f"[DEBUG] {src_name}: entrée sans titre ou lien → skip")
                 continue
 
             text_all = f"{title}. {strip_html(raw)}"
@@ -579,16 +587,15 @@ def main():
             if not contains_any(text_all, AI_HINTS):
                 print(f"[DEBUG FILTER] Pas IA : {title}")
                 continue
-            ai_pass += 1
+            ai_ok += 1
 
-            if not contains_any(text_all, DEFENSE_HINTS):
+            if not is_defense_context(text_all, source_title):
                 print(f"[DEBUG FILTER] Pas DEF/MAR/CYB : {title}")
                 continue
-            mil_pass += 1
+            def_ok += 1
 
             h = entry_hash(title, link)
             if h in seen_set:
-                print(f"[DEBUG] Doublon (hash) : {title}")
                 continue
             seen_set.add(h)
 
@@ -617,25 +624,19 @@ def main():
                 category=cat,
                 tags=tags
             ))
-            kept += 1
+            kept += 1; total_kept += 1
 
-        print(f"[SRC] {src_name} -> vus:{seen} IA_ok:{ai_pass} DEF_ok:{mil_pass} gardés:{kept}")
-
-    # Récap debug global
-    print("=== DEBUG RECAP ===")
-    total_entries = 0
-    for url in RSS_FEEDS.values():
-        try:
-            fd = parse_rss_with_headers(url)
-            n = len(fd.entries)
-            print(f"Feed {url} -> {n} entrées")
-            total_entries += n
-        except Exception as e:
-            print(f"Feed {url} ERROR: {e}")
-    print(f"Articles récupérés (tous flux) : {total_entries}")
-    print(f"Articles conservés (après filtres) : {len(items)}")
+        print(f"[SRC] {src_name} -> vus:{seen} IA_ok:{ai_ok} DEF_ok:{def_ok} gardés:{kept}")
 
     items.sort(key=lambda x: (x["rscore"], x["date"], x["score"]), reverse=True)
+    print("=== DEBUG RECAP ===")
+    for name, url in RSS_FEEDS.items():
+        # Ce bloc ne connaît plus les vus par source après la boucle,
+        # mais on a déjà imprimé la ligne [SRC] ci-dessus pour chaque source.
+        pass
+    print(f"Articles récupérés (tous flux) : {total_seen}")
+    print(f"Articles conservés (après filtres) : {total_kept}")
+
     build_html(items)
 
 if __name__ == "__main__":
