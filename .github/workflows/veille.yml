@@ -2,78 +2,79 @@ name: build
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - "veille_ia.py"
-      - ".github/workflows/**"
   schedule:
-    - cron: "0 */6 * * *"  # toutes les 6h
+    - cron: "25 5 * * *"  # tous les jours 05:25 UTC (à adapter)
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write     # nécessaire pour gh-pages
-      pages: write
-      id-token: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+      - name: Show requirements
+        run: |
+          echo "=== .github/workflows/requirements.txt ==="
+          cat .github/workflows/requirements.txt || true
 
-      - name: Install deps
-        run: pip install -r .github/workflows/requirements.txt
+      - name: Upgrade pip and install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r .github/workflows/requirements.txt
 
-      - name: Restore Argos cache
+      - name: Cache Argos models
         uses: actions/cache@v4
         with:
           path: ~/.local/share/argos-translate
-          key: ${{ runner.os }}-argos-cache-v1
+          key: argos-${{ runner.os }}-v1
 
-      - name: Preinstall Argos EN→FR
+      - name: Ensure Argos EN→FR model installed
+        env:
+          # ne pas échouer si offline ou déjà installé
+          PYTHONUNBUFFERED: "1"
         run: |
           python - <<'PY'
-          from argostranslate import package, translate
-          package.update_package_index()
-          pkgs = package.get_available_packages()
-          p = next(p for p in pkgs if p.from_code=="en" and p.to_code=="fr")
-          path = p.download()
-          package.install_from_path(path)
-          # Sanity check
-          langs = translate.get_installed_languages()
-          assert any(l.code=="en" for l in langs) and any(l.code=="fr" for l in langs)
-          print("Argos EN→FR OK")
+          try:
+              from argostranslate import package, translate
+              # Déjà installé ?
+              langs = translate.get_installed_languages()
+              have = False
+              for l in langs:
+                  for tr in l.translations:
+                      if tr.from_code == "en" and tr.to_code == "fr":
+                          have = True
+                          break
+              if not have:
+                  print("Installing Argos EN->FR package…")
+                  package.update_package_index()
+                  packages = package.get_available_packages()
+                  pkg = next(p for p in packages if p.from_code == "en" and p.to_code == "fr")
+                  download_path = pkg.download()
+                  package.install_from_path(download_path)
+                  print("✅ Argos EN->FR installed")
+              else:
+                  print("✅ Argos EN->FR already installed")
+          except Exception as e:
+              print(f"⚠️ Argos model install skipped/failed: {e}")
           PY
-
-      - name: Save Argos cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.local/share/argos-translate
-          key: ${{ runner.os }}-argos-cache-v1
 
       - name: Run generator
         env:
-          DAYS_WINDOW: "45"
-          RELEVANCE_MIN: "0.18"
-          MAX_SUMMARY_CHARS: "320"
           OFFLINE_TRANSLATION: "1"
-        run: python veille_ia.py
+          DAYS_WINDOW: "45"
+          RELEVANCE_MIN: "0.28"
+        run: |
+          python veille_ia.py
 
-      # Déploiement : branche gh-pages
-      - name: Deploy to GitHub Pages
+      - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
+          publish_branch: gh-pages
