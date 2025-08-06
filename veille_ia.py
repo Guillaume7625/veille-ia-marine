@@ -5,7 +5,8 @@
 Veille IA – Militaire (Marine)
 - Collecte des flux RSS IA/Défense
 - Résumés FR (nettoyage, 2 phrases max, traduction offline EN->FR si dispo)
-- Filtre strict : IA OBLIGATOIRE + co-occurrence IA/DEF dans le titre ou une même phrase
+- Filtre strict : IA OBLIGATOIRE + co-occurrence IA/DEF
+  dans le titre ou une même phrase
 - Scoring (mots-clés + fraîcheur + autorité source)
 - HTML Tailwind avec filtres & export CSV (docs/index.html)
 """
@@ -16,6 +17,7 @@ import html
 import time
 import logging
 import hashlib
+import unicodedata
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple, Set
@@ -27,6 +29,7 @@ from dateutil import parser as date_parser
 
 # =========================== Config ===========================
 
+
 @dataclass
 class Config:
     days_window: int = int(os.getenv("DAYS_WINDOW", "45"))
@@ -37,7 +40,11 @@ class Config:
     output_file: str = "index.html"
     request_timeout: int = 25
     max_retries: int = 3
-    user_agent: str = "VeilleIA-Military/2.1 (+https://github.com/guillaume7625/veille-ia-marine)"
+    user_agent: str = (
+        "VeilleIA-Military/2.1 "
+        "(+https://github.com/guillaume7625/veille-ia-marine)"
+    )
+
 
 config = Config()
 
@@ -94,68 +101,125 @@ SEMANTIC_KEYWORDS = {
     "ai_core": {
         "weight": 5,
         "terms": [
-            "intelligence artificielle", "ia", "ai", "artificial intelligence",
+            "intelligence artificielle",
+            "ia",
+            "ai",
+            "artificial intelligence",
         ],
     },
     "ml_techniques": {
         "weight": 4,
         "terms": [
-            "machine learning", "deep learning", "neural network",
-            "apprentissage automatique", "réseau neuronal",
-            "transformer", "inference", "inférence",
+            "machine learning",
+            "deep learning",
+            "neural network",
+            "apprentissage automatique",
+            "réseau neuronal",
+            "transformer",
+            "inference",
+            "inférence",
         ],
     },
     "ai_applications": {
         "weight": 3,
         "terms": [
-            "computer vision", "vision par ordinateur",
-            "nlp", "natural language processing", "traitement du langage",
-            "speech recognition", "reconnaissance vocale",
+            "computer vision",
+            "vision par ordinateur",
+            "nlp",
+            "natural language processing",
+            "traitement du langage",
+            "speech recognition",
+            "reconnaissance vocale",
         ],
     },
     "generative_ai": {
         "weight": 4,
         "terms": [
-            "llm", "large language model", "gpt", "generative ai", "génératif",
-            "diffusion model", "gan",
+            "llm",
+            "large language model",
+            "gpt",
+            "generative ai",
+            "génératif",
+            "diffusion model",
+            "gan",
         ],
     },
     "naval_platforms": {
         "weight": 5,
         "terms": [
-            "marine", "naval", "navy", "frégate", "fregate", "destroyer",
-            "sous-marin", "submarine", "corvette", "porte-avions",
-            "aircraft carrier", "maritime",
+            "marine",
+            "naval",
+            "navy",
+            "frégate",
+            "fregate",
+            "destroyer",
+            "sous-marin",
+            "submarine",
+            "corvette",
+            "porte-avions",
+            "aircraft carrier",
+            "maritime",
         ],
     },
     "defense_systems": {
         "weight": 4,
         "terms": [
-            "radar", "sonar", "lidar", "ew", "electronic warfare", "guerre électronique",
-            "missile", "torpedo", "countermeasure", "contre-mesure",
+            "radar",
+            "sonar",
+            "lidar",
+            "ew",
+            "electronic warfare",
+            "guerre électronique",
+            "missile",
+            "torpedo",
+            "countermeasure",
+            "contre-mesure",
         ],
     },
     "c4isr": {
         "weight": 5,
         "terms": [
-            "c4isr", "c2", "command", "control", "isr",
+            "c4isr",
+            "c2",
+            "command",
+            "control",
+            "isr",
             "intelligence surveillance reconnaissance",
-            "situational awareness", "sensor fusion", "reconnaissance",
+            "situational awareness",
+            "sensor fusion",
+            "reconnaissance",
         ],
     },
     "cyber_defense": {
         "weight": 4,
         "terms": [
-            "cyber", "cybersécurité", "cybersecurity", "cyber defense", "cyberdéfense",
-            "ransomware", "malware", "intrusion", "apt", "zero day", "soc",
+            "cyber",
+            "cybersécurité",
+            "cybersecurity",
+            "cyber defense",
+            "cyberdéfense",
+            "ransomware",
+            "malware",
+            "intrusion",
+            "apt",
+            "zero day",
+            "soc",
             "threat intelligence",
         ],
     },
     "autonomous_systems": {
         "weight": 4,
         "terms": [
-            "drone", "uav", "uas", "usv", "uuv", "unmanned",
-            "autonomous", "autonome", "swarm", "essaim",
+            "drone",
+            "uav",
+            "uas",
+            "usv",
+            "uuv",
+            "unmanned",
+            "autonomous",
+            "autonome",
+            "swarm",
+            "essaim",
         ],
     },
 }
@@ -180,11 +244,27 @@ AI_PATTERNS = [
     r"\b(inférence|inference)\b",
 ]
 DEF_PATTERNS = [
-    r"\b(naval|marine|navy|frégate|fregate|destroyer|sous-?marin|submarine|corvette|porte-?avions|aircraft carrier|maritime)\b",
-    r"\b(c4isr|c2|isr|command|control|surveillance|reconnaissance|situational awareness|sensor fusion)\b",
-    r"\b(radar|sonar|lidar|ew|electronic warfare|guerre électronique|missile|torpedo|counter-?measure)\b",
-    r"\b(cyber|cybersécurité|cybersecurity|ransomware|malware|intrusion|apt|zero[- ]?day|soc|threat intelligence)\b",
-    r"\b(drone|uav|uas|usv|uuv|unmanned|autonom(?:e|ous)|swarm|essaim)\b",
+    (
+        r"\b(naval|marine|navy|frégate|fregate|destroyer|"
+        r"sous-?marin|submarine|"
+        r"corvette|porte-?avions|aircraft carrier|maritime)\b"
+    ),
+    (
+        r"\b(c4isr|c2|isr|command|control|surveillance|reconnaissance|"
+        r"situational awareness|sensor fusion)\b"
+    ),
+    (
+        r"\b(radar|sonar|lidar|ew|electronic warfare|guerre électronique|"
+        r"missile|torpedo|counter-?measure)\b"
+    ),
+    (
+        r"\b(cyber|cybersécurité|cybersecurity|ransomware|malware|intrusion|"
+        r"apt|zero[- ]?day|soc|threat intelligence)\b"
+    ),
+    (
+        r"\b(drone|uav|uas|usv|uuv|unmanned|autonom(?:e|ous)|"
+        r"swarm|essaim)\b"
+    ),
 ]
 
 AI_PATTERNS_RE = [re.compile(p, re.IGNORECASE) for p in AI_PATTERNS]
@@ -197,6 +277,9 @@ POST_FOOTER_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WHITESPACE_RE = re.compile(r"\s+")
+
 # ========================== Logging ===========================
 
 logging.basicConfig(
@@ -208,54 +291,96 @@ logger = logging.getLogger(__name__)
 
 # =========================== Utils ============================
 
+
 def normalize_text(text: str) -> str:
+    """Lowercase and remove accents from text."""
     if not text:
         return ""
-    import unicodedata
     t = text.lower()
     t = unicodedata.normalize("NFKD", t)
     t = "".join(c for c in t if not unicodedata.combining(c))
     return t
 
+
 def strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace."""
     if not text:
         return ""
-    t = re.sub(r"<[^>]+>", " ", text)
-    t = re.sub(r"\s+", " ", t).strip()
+    t = HTML_TAG_RE.sub(" ", text)
+    t = WHITESPACE_RE.sub(" ", t).strip()
     return t
 
+
 def clean_rss_boilerplate(text: str) -> str:
+    """Unescape HTML, strip tags and remove boilerplate footers."""
     if not text:
         return ""
     t = html.unescape(text)
     t = strip_html(t)
     t = POST_FOOTER_RE.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip()
+    t = WHITESPACE_RE.sub(" ", t).strip()
     return t
 
+
 def split_sentences(text: str) -> List[str]:
+    """Split text into sentences using punctuation heuristics."""
     if not text:
         return []
     parts = re.split(r"(?<=[\.\!\?])\s+", text)
     return [p.strip() for p in parts if p.strip()]
 
+
+FR_COMMON_WORDS = [
+    " le ",
+    " la ",
+    " les ",
+    " un ",
+    " une ",
+    " des ",
+    " du ",
+    " de ",
+    " qui ",
+    " que ",
+    " est ",
+    " sont ",
+    " avec ",
+    " dans ",
+    " pour ",
+]
+EN_COMMON_WORDS = [
+    " the ",
+    " and ",
+    " with ",
+    " from ",
+    " that ",
+    " this ",
+    " which ",
+    " what ",
+    " can ",
+    " will ",
+    " would ",
+    " should ",
+    " have ",
+    " has ",
+]
+
+
 def detect_language_simple(text: str) -> str:
+    """Heuristically detect whether a text is French or English."""
     if not text:
         return "unknown"
     t = f" {text.lower()} "
-    fr = [' le ', ' la ', ' les ', ' un ', ' une ', ' des ', ' du ', ' de ',
-          ' qui ', ' que ', ' est ', ' sont ', ' avec ', ' dans ', ' pour ']
-    en = [' the ', ' and ', ' with ', ' from ', ' that ', ' this ', ' which ',
-          ' what ', ' can ', ' will ', ' would ', ' should ', ' have ', ' has ']
-    fs = sum(1 for m in fr if m in t)
-    es = sum(1 for m in en if m in t)
+    fs = sum(1 for m in FR_COMMON_WORDS if m in t)
+    es = sum(1 for m in EN_COMMON_WORDS if m in t)
     if fs > es:
         return "fr"
     if es > fs:
         return "en"
     return "unknown"
 
+
 # ======================= Modèle d'article =====================
+
 
 @dataclass
 class Article:
@@ -278,9 +403,13 @@ class Article:
 
     @property
     def hash_id(self) -> str:
-        return hashlib.md5(f"{self.title}|{self.link}".encode("utf-8")).hexdigest()
+        return hashlib.md5(
+            f"{self.title}|{self.link}".encode("utf-8")
+        ).hexdigest()
+
 
 # ===================== Traduction offline =====================
+
 
 class TranslationService:
     def __init__(self):
@@ -290,13 +419,16 @@ class TranslationService:
 
     def _setup(self):
         if not config.offline_translation:
-            logger.info("Traduction offline désactivée (OFFLINE_TRANSLATION=0).")
+            logger.info(
+                "Traduction offline désactivée (OFFLINE_TRANSLATION=0)."
+            )
             return
         try:
             from argostranslate import translate as argos_translate
+
             langs = argos_translate.get_installed_languages()
-            en = next((l for l in langs if l.code == "en"), None)
-            fr = next((l for l in langs if l.code == "fr"), None)
+            en = next((lang for lang in langs if lang.code == "en"), None)
+            fr = next((lang for lang in langs if lang.code == "fr"), None)
             if en and fr:
                 self.translation = en.get_translation(fr)
                 self.available = self.translation is not None
@@ -305,7 +437,10 @@ class TranslationService:
                 else:
                     logger.warning("⚠️ Argos EN→FR non initialisé.")
             else:
-                logger.warning("⚠️ Modèles Argos EN/FR absents (le workflow peut les installer).")
+                logger.warning(
+                    "⚠️ Modèles Argos EN/FR absents "
+                    "(le workflow peut les installer)."
+                )
         except Exception as e:
             logger.warning(f"⚠️ Argos indisponible: {e}")
 
@@ -321,7 +456,9 @@ class TranslationService:
             logger.warning(f"Erreur traduction: {e}")
             return text, False
 
+
 # ====================== Analyse de contenu =====================
+
 
 class ContentAnalyzer:
     def __init__(self):
@@ -336,7 +473,9 @@ class ContentAnalyzer:
         t = text or ""
         return any(p.search(t) for p in DEF_PATTERNS_RE)
 
-    def _cooccurs_ai_def_in_title_or_sentence(self, title: str, summary: str) -> bool:
+    def _cooccurs_ai_def_in_title_or_sentence(
+        self, title: str, summary: str
+    ) -> bool:
         scopes = [title] + split_sentences(summary)
         for scope in scopes:
             s = scope.lower()
@@ -349,11 +488,13 @@ class ContentAnalyzer:
         for pattern in EXCLUSION_PATTERNS:
             if re.search(pattern, text_norm):
                 defense_ctx_terms = (
-                    SEMANTIC_KEYWORDS["naval_platforms"]["terms"] +
-                    SEMANTIC_KEYWORDS["defense_systems"]["terms"] +
-                    SEMANTIC_KEYWORDS["c4isr"]["terms"]
+                    SEMANTIC_KEYWORDS["naval_platforms"]["terms"]
+                    + SEMANTIC_KEYWORDS["defense_systems"]["terms"]
+                    + SEMANTIC_KEYWORDS["c4isr"]["terms"]
                 )
-                if not any(normalize_text(t) in text_norm for t in defense_ctx_terms):
+                if not any(
+                    normalize_text(t) in text_norm for t in defense_ctx_terms
+                ):
                     return True
         return False
 
@@ -377,7 +518,11 @@ class ContentAnalyzer:
                 if normalize_text(term) in t:
                     sem += 0.1 * w
         # fraîcheur (demi-vie ~3 jours)
-        age_h = max(0.0, (datetime.now(timezone.utc) - article.date).total_seconds() / 3600.0)
+        age_h = max(
+            0.0,
+            (datetime.now(timezone.utc) - article.date).total_seconds()
+            / 3600.0,
+        )
         freshness = max(0.5, 2 ** (-age_h / 72.0))
         # bonus co-occurrence
         co = 1.3 if (self._has_ai(t) and self._has_defense(t)) else 1.0
@@ -386,40 +531,102 @@ class ContentAnalyzer:
 
     def classify_category(self, text: str) -> str:
         t = text.lower()
-        if re.search(r"\b(policy|réglementation|regulation|budget|appropriation|spending|bill|award|contract|option year|procurement|acquisition)\b", t):
+        if re.search(
+            (
+                r"\b(policy|réglementation|regulation|budget|appropriation|"
+                r"spending|bill|award|contract|option year|procurement|"
+                r"acquisition)\b"
+            ),
+            t,
+        ):
             return "POLICY"
-        if re.search(r"\b(prototype|trial|essai|r&d|laboratoire|lab|research|paper)\b", t):
+        if re.search(
+            r"\b(prototype|trial|essai|r&d|laboratoire|lab|research|paper)\b",
+            t,
+        ):
             return "DEVELOPMENT"
-        if re.search(r"\b(deployment|deployed|fielded|opérationnel|operational|exercise|exercice)\b", t):
+        if re.search(
+            (
+                r"\b(deployment|deployed|fielded|opérationnel|operational|"
+                r"exercise|exercice)\b"
+            ),
+            t,
+        ):
             return "OPERATIONAL"
-        if re.search(r"\b(threat|menace|intrusion|ransomware|ew|electronic warfare|counter-uas|counter uas)\b", t):
+        if re.search(
+            (
+                r"\b(threat|menace|intrusion|ransomware|ew|electronic warfare|"
+                r"counter-uas|counter uas)\b"
+            ),
+            t,
+        ):
             return "THREAT"
-        if re.search(r"\b(partnership|alliance|accord|coopération|framework|mou|moa)\b", t):
+        if re.search(
+            r"\b(partnership|alliance|accord|coopération|framework|mou|moa)\b",
+            t,
+        ):
             return "PARTNERSHIP"
         return "TECHNOLOGY"
 
     def generate_tags(self, article: Article) -> List[str]:
         t = f"{article.title} {article.summary}".lower()
         tags = set()
-        if re.search(r"\b(llm|large language model|génératif|generative ai|diffusion model|gan)\b", t):
+        if re.search(
+            (
+                r"\b(llm|large language model|génératif|generative ai|"
+                r"diffusion model|gan)\b"
+            ),
+            t,
+        ):
             tags.add("LLM/Génératif")
         if re.search(r"\b(computer vision|vision par ordinateur)\b", t):
             tags.add("Vision Artificielle")
-        if re.search(r"\b(nlp|traitement du langage|natural language processing)\b", t):
+        if re.search(
+            r"\b(nlp|traitement du langage|natural language processing)\b", t
+        ):
             tags.add("NLP")
 
-        if re.search(r"\b(naval|marine|navy|sous-?marin|submarine|destroyer|frégate|fregate|maritime)\b", t):
+        if re.search(
+            (
+                r"\b(naval|marine|navy|sous-?marin|submarine|destroyer|"
+                r"frégate|fregate|maritime)\b"
+            ),
+            t,
+        ):
             tags.add("Naval")
-        if re.search(r"\b(c4isr|c2|isr|command|control|surveillance|reconnaissance)\b", t):
+        if re.search(
+            r"\b(c4isr|c2|isr|command|control|surveillance|reconnaissance)\b",
+            t,
+        ):
             tags.add("C4ISR")
-        if re.search(r"\b(cyber|cybersécurité|cybersecurity|ransomware|malware|intrusion)\b", t):
+        if re.search(
+            (
+                r"\b(cyber|cybersécurité|cybersecurity|ransomware|malware|"
+                r"intrusion)\b"
+            ),
+            t,
+        ):
             tags.add("Cybersécurité")
-        if re.search(r"\b(drone|uav|uas|usv|uuv|unmanned|autonom(?:e|ous)|swarm|essaim)\b", t):
+        if re.search(
+            (
+                r"\b(drone|uav|uas|usv|uuv|unmanned|autonom(?:e|ous)|"
+                r"swarm|essaim)\b"
+            ),
+            t,
+        ):
             tags.add("Systèmes Autonomes")
 
-        if re.search(r"\b(prototype|research|laboratoire|laboratory|paper)\b", t):
+        if re.search(
+            r"\b(prototype|research|laboratoire|laboratory|paper)\b", t
+        ):
             tags.add("R&D")
-        if re.search(r"\b(deployment|deployed|fielded|operational|opérationnel|exercise|exercice)\b", t):
+        if re.search(
+            (
+                r"\b(deployment|deployed|fielded|operational|opérationnel|"
+                r"exercise|exercice)\b"
+            ),
+            t,
+        ):
             tags.add("Opérationnel")
 
         return sorted(tags) if tags else ["—"]
@@ -429,6 +636,7 @@ class ContentAnalyzer:
         for fld in ("published_parsed", "updated_parsed"):
             if hasattr(entry, fld) and getattr(entry, fld):
                 import calendar
+
                 try:
                     ts = calendar.timegm(getattr(entry, fld))
                     return datetime.fromtimestamp(ts, tz=timezone.utc)
@@ -444,7 +652,9 @@ class ContentAnalyzer:
         return None
 
     # --- Pipeline article ---
-    def process_entry(self, entry, src_name: str, meta: Dict) -> Optional[Article]:
+    def process_entry(
+        self, entry, src_name: str, meta: Dict
+    ) -> Optional[Article]:
         title = (entry.get("title") or "").strip()
         link = (entry.get("link") or "").strip()
         raw = entry.get("summary") or entry.get("description") or ""
@@ -466,7 +676,9 @@ class ContentAnalyzer:
 
         # Limitation longueur
         if len(summary) > config.max_summary_chars:
-            summary = summary[:config.max_summary_chars - 1].rsplit(" ", 1)[0] + "…"
+            summary = (
+                summary[: config.max_summary_chars - 1].rsplit(" ", 1)[0] + "…"
+            )
 
         # Date
         dt = self._parse_date(entry) or datetime.now(timezone.utc)
@@ -497,7 +709,9 @@ class ContentAnalyzer:
 
         # Scores
         article.keyword_score = self._keyword_score(f"{title} {summary}")
-        article.relevance_score = self._relevance_score(article, meta.get("authority", 1.0))
+        article.relevance_score = self._relevance_score(
+            article, meta.get("authority", 1.0)
+        )
         article.category = self.classify_category(f"{title} {summary}")
         article.tags = self.generate_tags(article)
 
@@ -511,7 +725,9 @@ class ContentAnalyzer:
 
         return article
 
+
 # ===================== Collecteur RSS réseau ====================
+
 
 class RSSCollector:
     def __init__(self):
@@ -525,16 +741,23 @@ class RSSCollector:
                 r.raise_for_status()
                 feed = feedparser.parse(r.content)
                 if feed.bozo and getattr(feed, "bozo_exception", None):
-                    logging.warning(f"Feed partiellement malformé: {feed.bozo_exception}")
+                    logging.warning(
+                        f"Feed partiellement malformé: {feed.bozo_exception}"
+                    )
                 return feed
             except requests.RequestException as e:
-                logging.warning(f"[{attempt+1}/{config.max_retries}] Erreur réseau {url}: {e}")
+                logging.warning(
+                    f"[{attempt+1}/{config.max_retries}] "
+                    f"Erreur réseau {url}: {e}"
+                )
                 if attempt < config.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
         logging.error(f"Échec définitif {url}")
         return feedparser.FeedParserDict(feed={}, entries=[])
 
+
 # ======================= Générateur HTML =======================
+
 
 class HTMLGenerator:
     def __init__(self, articles: List[Article]):
@@ -545,8 +768,16 @@ class HTMLGenerator:
         high = sum(1 for a in self.articles if a.priority_level == "HIGH")
         translated = sum(1 for a in self.articles if a.translated)
         sources = len({a.source for a in self.articles})
-        avg_rel = round(sum(a.relevance_score for a in self.articles) / max(1, total), 3)
-        return dict(total=total, high=high, translated=translated, sources=sources, avg=avg_rel)
+        avg_rel = round(
+            sum(a.relevance_score for a in self.articles) / max(1, total), 3
+        )
+        return dict(
+            total=total,
+            high=high,
+            translated=translated,
+            sources=sources,
+            avg=avg_rel,
+        )
 
     def _header(self, stats: Dict) -> str:
         generated = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -557,80 +788,143 @@ class HTMLGenerator:
       <span class="text-2xl">⚓</span>
       <div>
         <h1 class="text-2xl font-bold">Veille IA – Militaire</h1>
-        <div class="text-blue-200 text-sm">
-          Fenêtre {config.days_window} jours • Généré : {generated} • Seuil pertinence : {config.relevance_min}
-        </div>
+          <div class="text-blue-200 text-sm">
+            Fenêtre {config.days_window} jours • Généré : {generated}
+            • Seuil pertinence : {config.relevance_min}
+          </div>
       </div>
     </div>
-    <button id="btnCsv" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">Exporter CSV</button>
+      <button id="btnCsv"
+              class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">
+        Exporter CSV
+      </button>
   </div>
 </header>
 """
 
     def _filters(self) -> str:
         cats = sorted({a.category for a in self.articles})
-        cat_opts = "".join(f"<option value='{html.escape(c)}'>{html.escape(c)}</option>" for c in cats)
+        cat_opts = "".join(
+            f"<option value='{html.escape(c)}'>{html.escape(c)}</option>"
+            for c in cats
+        )
         return f"""
 <main class="max-w-7xl mx-auto px-4 py-6">
-  <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-blue-700">{len(self.articles)}</div>
-      <div class="text-gray-600">Articles</div>
+    <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
+      <div class="bg-white rounded shadow p-4 text-center">
+        <div class="text-3xl font-bold text-blue-700">
+          {len(self.articles)}
+        </div>
+        <div class="text-gray-600">Articles</div>
+      </div>
+      <div class="bg-white rounded shadow p-4 text-center">
+        <div class="text-3xl font-bold text-red-600">
+          {sum(1 for a in self.articles if a.priority_level == 'HIGH')}
+        </div>
+        <div class="text-gray-600">Priorité Haute</div>
+      </div>
+      <div class="bg-white rounded shadow p-4 text-center">
+        <div class="text-3xl font-bold text-green-600">
+          {len({a.source for a in self.articles})}
+        </div>
+        <div class="text-gray-600">Sources actives</div>
+      </div>
+      <div class="bg-white rounded shadow p-4 text-center">
+        <div class="text-3xl font-bold text-purple-600">
+          {sum(1 for a in self.articles if a.translated)}
+        </div>
+        <div class="text-gray-600">Traduit FR</div>
+      </div>
+      <div class="bg-white rounded shadow p-4 text-center">
+        <div class="text-sm text-gray-600">Pertinence moyenne</div>
+        <div class="text-xl font-semibold">
+          {
+            round(
+                sum(a.relevance_score for a in self.articles)
+                / max(1, len(self.articles)),
+                3,
+            )
+          }
+        </div>
+      </div>
     </div>
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-red-600">{sum(1 for a in self.articles if a.priority_level=='HIGH')}</div>
-      <div class="text-gray-600">Priorité Haute</div>
-    </div>
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-green-600">{len({a.source for a in self.articles})}</div>
-      <div class="text-gray-600">Sources actives</div>
-    </div>
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-3xl font-bold text-purple-600">{sum(1 for a in self.articles if a.translated)}</div>
-      <div class="text-gray-600">Traduit FR</div>
-    </div>
-    <div class="bg-white rounded shadow p-4 text-center">
-      <div class="text-sm text-gray-600">Pertinence moyenne</div>
-      <div class="text-xl font-semibold">{round(sum(a.relevance_score for a in self.articles)/max(1,len(self.articles)),3)}</div>
-    </div>
-  </div>
 
-  <div class="bg-white rounded shadow p-4 mb-4">
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-      <input id="q" type="search" placeholder="Recherche (titre, résumé, tags)…" class="border rounded px-3 py-2">
-      <select id="level" class="border rounded px-3 py-2">
-        <option value="">Niveau (tous)</option>
-        <option value="HIGH">HIGH</option>
-        <option value="MEDIUM">MEDIUM</option>
-        <option value="LOW">LOW</option>
-      </select>
-      <input id="source" type="search" placeholder="Filtrer par source…" class="border rounded px-3 py-2">
-      <select id="cat" class="border rounded px-3 py-2">
-        <option value="">Catégorie (toutes)</option>
-        {cat_opts}
-      </select>
+    <div class="bg-white rounded shadow p-4 mb-4">
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <input
+          id="q"
+          type="search"
+          placeholder="Recherche (titre, résumé, tags)…"
+          class="border rounded px-3 py-2"
+        >
+        <select id="level" class="border rounded px-3 py-2">
+          <option value="">Niveau (tous)</option>
+          <option value="HIGH">HIGH</option>
+          <option value="MEDIUM">MEDIUM</option>
+          <option value="LOW">LOW</option>
+        </select>
+        <input
+          id="source"
+          type="search"
+          placeholder="Filtrer par source…"
+          class="border rounded px-3 py-2"
+        >
+        <select id="cat" class="border rounded px-3 py-2">
+          <option value="">Catégorie (toutes)</option>
+          {cat_opts}
+        </select>
+      </div>
     </div>
-  </div>
 """
 
     def _table(self) -> str:
         def level_badge(lv: str) -> str:
-            return {"HIGH": "bg-red-600", "MEDIUM": "bg-orange-600", "LOW": "bg-green-600"}.get(lv, "bg-gray-600")
+            return {
+                "HIGH": "bg-red-600",
+                "MEDIUM": "bg-orange-600",
+                "LOW": "bg-green-600",
+            }.get(lv, "bg-gray-600")
+
         rows = []
         for a in self.articles:
-            t_badge = ' <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" style="background:#6d28d9">🇫🇷 Traduit</span>' if a.translated else ""
+            t_badge = (
+                ' <span class="ml-2 px-2 py-0.5 rounded text-xs text-white" '
+                'style="background:#6d28d9">🇫🇷 Traduit</span>'
+                if a.translated
+                else ""
+            )
             rows.append(
                 "<tr class='hover:bg-gray-50' "
-                f"data-level='{a.priority_level}' data-source='{html.escape(a.source)}' data-cat='{html.escape(a.category)}'>"
-                f"<td class='p-3 text-sm text-gray-600'>{a.date.strftime('%Y-%m-%d')}</td>"
-                f"<td class='p-3 text-xs'><span class='bg-blue-100 text-blue-800 px-2 py-1 rounded'>{html.escape(a.source)}</span></td>"
-                f"<td class='p-3'><a class='text-blue-700 hover:underline font-semibold' target='_blank' href='{html.escape(a.link)}'>{html.escape(a.title)}</a></td>"
-                f"<td class='p-3 text-sm text-gray-800'>{html.escape(a.summary)}{t_badge}</td>"
-                f"<td class='p-3 text-center'><span class='bg-indigo-100 text-indigo-800 px-2 py-1 rounded text-sm font-bold'>{a.keyword_score}</span></td>"
-                f"<td class='p-3 text-center'><span class='text-white px-2 py-1 rounded text-xs {level_badge(a.priority_level)}'>{a.priority_level}</span></td>"
-                f"<td class='p-3 text-sm'><span class='px-2 py-1 rounded text-white text-xs' style='background:#0f766e'>{html.escape(a.category)}</span></td>"
-                f"<td class='p-3 text-center text-sm'><span class='bg-gray-100 text-gray-800 px-2 py-1 rounded'>{round(a.relevance_score,3)}</span></td>"
-                f"<td class='p-3 text-sm'>{html.escape(', '.join(a.tags) if a.tags else '—')}</td>"
+                f"data-level='{a.priority_level}' "
+                f"data-source='{html.escape(a.source)}' "
+                f"data-cat='{html.escape(a.category)}'>"
+                f"<td class='p-3 text-sm text-gray-600'>"
+                f"{a.date.strftime('%Y-%m-%d')}</td>"
+                f"<td class='p-3 text-xs'><span class='bg-blue-100 "
+                f"text-blue-800 px-2 py-1 rounded'>"
+                f"{html.escape(a.source)}</span></td>"
+                f"<td class='p-3'><a class='text-blue-700 hover:underline "
+                f"font-semibold' "
+                f"target='_blank' href='{html.escape(a.link)}'>"
+                f"{html.escape(a.title)}</a></td>"
+                f"<td class='p-3 text-sm text-gray-800'>"
+                f"{html.escape(a.summary)}{t_badge}</td>"
+                f"<td class='p-3 text-center'><span class='bg-indigo-100 "
+                f"text-indigo-800 px-2 py-1 rounded text-sm font-bold'>"
+                f"{a.keyword_score}</span></td>"
+                f"<td class='p-3 text-center'>"
+                f"<span class='text-white px-2 py-1 rounded text-xs "
+                f"{level_badge(a.priority_level)}'>"
+                f"{a.priority_level}</span></td>"
+                f"<td class='p-3 text-sm'>"
+                f"<span class='px-2 py-1 rounded text-white text-xs' "
+                f"style='background:#0f766e'>"
+                f"{html.escape(a.category)}</span></td>"
+                f"<td class='p-3 text-center text-sm'>"
+                f"<span class='bg-gray-100 text-gray-800 px-2 py-1 rounded'>"
+                f"{round(a.relevance_score, 3)}</span></td>"
+                f"<td class='p-3 text-sm'>"
+                f"{html.escape(', '.join(a.tags) if a.tags else '—')}</td>"
                 "</tr>"
             )
         return f"""
@@ -685,10 +979,17 @@ class HTMLGenerator:
       tr.style.display = ok ? "" : "none";
     });
   }
-  [q, level, source, cat].forEach(el => el.addEventListener("input", applyFilters));
+    [q, level, source, cat].forEach(el =>
+      el.addEventListener("input", applyFilters)
+    );
 
-  document.getElementById("btnCsv").addEventListener("click", () => {
-    const header = ["Titre","Lien","Date","Source","Résumé","Niveau","Score","Catégorie","Pertinence","Tags"];
+    document
+      .getElementById("btnCsv")
+      .addEventListener("click", () => {
+    const header = [
+      "Titre","Lien","Date","Source","Résumé","Niveau",
+      "Score","Catégorie","Pertinence","Tags"
+    ];
     const table = document.querySelector("#tbody");
     const data = [];
     for (const tr of table.querySelectorAll("tr")) {
@@ -711,11 +1012,24 @@ class HTMLGenerator:
       ];
       data.push(row);
     }
-    const csv = [header, ...data].map(r => r.map(x => '"' + String((x==null ? "" : x)).replace(/"/g,'""') + '"').join(",")).join("\\n");
+      const csv = [header, ...data]
+        .map(r =>
+          r
+            .map(
+              x =>
+                '"' +
+                String((x == null ? "" : x)).replace(/"/g, '""') +
+                '"'
+            )
+            .join(",")
+        )
+        .join("\\n");
     const blob = new Blob([csv], {type: "text/csv;charset=utf-8"});
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = "veille_ia_militaire.csv"; a.click();
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "veille_ia_militaire.csv";
+      a.click();
     URL.revokeObjectURL(url);
   });
 })();
@@ -729,7 +1043,9 @@ class HTMLGenerator:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Veille IA – Militaire</title>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link
+      href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"
+      rel="stylesheet">
   <style>
     .summary-cell {{
       max-height: 4.5rem;
@@ -750,10 +1066,16 @@ class HTMLGenerator:
 </html>
 """
 
+
 # =========================== Main ==============================
 
+
 def main():
-    logger.info(f"CFG days_window={config.days_window} relevance_min={config.relevance_min} offline_translation={config.offline_translation}")
+    logger.info(
+        f"CFG days_window={config.days_window} "
+        f"relevance_min={config.relevance_min} "
+        f"offline_translation={config.offline_translation}"
+    )
     collector = RSSCollector()
     analyzer = ContentAnalyzer()
 
@@ -783,15 +1105,23 @@ def main():
             kept.append(art)
 
     # Tri : pertinence desc, date desc, keyword_score desc
-    kept.sort(key=lambda a: (a.relevance_score, a.date, a.keyword_score), reverse=True)
+    kept.sort(
+        key=lambda a: (a.relevance_score, a.date, a.keyword_score),
+        reverse=True,
+    )
 
     # Génération HTML
     config.output_dir.mkdir(parents=True, exist_ok=True)
     html_page = HTMLGenerator(kept).build()
-    (config.output_dir / config.output_file).write_text(html_page, encoding="utf-8")
+    (config.output_dir / config.output_file).write_text(
+        html_page, encoding="utf-8"
+    )
 
     logger.info(f"Articles récupérés : {total_seen} • conservés : {len(kept)}")
-    logger.info(f"✅ Rapport écrit dans {config.output_dir / config.output_file}")
+    logger.info(
+        f"✅ Rapport écrit dans {config.output_dir / config.output_file}"
+    )
+
 
 if __name__ == "__main__":
     main()
